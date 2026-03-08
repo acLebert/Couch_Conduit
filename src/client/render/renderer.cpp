@@ -615,6 +615,28 @@ void Renderer::Stop() {
         m_renderThread.join();
     }
     m_overlay.Shutdown();
+
+    // Release all D3D11 references so the swap chain is truly freed.
+    // Without ClearState + Flush, the context keeps internal refs to
+    // the back buffer / RTV, preventing DXGI from releasing the HWND
+    // association — which blocks a fresh swap chain on the same window.
+    if (m_context) {
+        m_context->ClearState();
+        m_context->Flush();
+    }
+    m_rtv.Reset();
+    m_srvY.Reset();
+    m_srvUV.Reset();
+    m_nv12Staging.Reset();
+    m_tsStart.Reset();
+    m_tsEnd.Reset();
+    m_tsDisjoint.Reset();
+    m_vertexShader.Reset();
+    m_pixelShader.Reset();
+    m_sampler.Reset();
+    m_swapChain.Reset();
+    m_context.Reset();
+    m_device.Reset();
 }
 
 }  // namespace cc::client

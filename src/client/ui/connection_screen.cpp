@@ -31,7 +31,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 
 namespace {
 
-// ─── State shared between WndProc and render loop ──────────────────────
+// ─── State shared between WndProc and render loop ───────────────────────
 static std::atomic<bool> s_quit{false};
 static WNDPROC           s_origWndProc = nullptr;
 
@@ -44,8 +44,7 @@ static LRESULT CALLBACK ConnectionWndProc(HWND hwnd, UINT msg,
         case WM_CLOSE:
         case WM_DESTROY:
             s_quit = true;
-            PostQuitMessage(0);
-            return 0;
+            return 0;   // Don't PostQuitMessage — just flag the loop
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }

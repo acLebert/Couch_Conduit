@@ -409,6 +409,22 @@ int main(int argc, char* argv[]) {
 
             if (!g_running) break;  // window closed — exit completely
 
+            // Drain any pending messages before re-showing connection screen.
+            // This prevents stale WM_QUIT or other messages from the old
+            // session interfering with the new ImGui context.
+            {
+                MSG drain;
+                while (PeekMessageW(&drain, nullptr, 0, 0, PM_REMOVE)) {
+                    if (drain.message == WM_QUIT) {
+                        // Re-post will be caught by connection screen if user
+                        // actually closed the window; otherwise discard it
+                        // since we're intentionally returning to connection UI.
+                    }
+                    TranslateMessage(&drain);
+                    DispatchMessageW(&drain);
+                }
+            }
+
             CC_INFO("Returning to connection screen");
             // Loop back to ShowConnectionScreen
         }
