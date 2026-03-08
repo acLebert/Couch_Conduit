@@ -27,6 +27,8 @@ struct CliArgs {
     std::string clientHost = "127.0.0.1";
     uint32_t    bitrateKbps = 20000;
     uint32_t    fps = 60;
+    uint32_t    encodeWidth = 0;   // 0 = same as capture
+    uint32_t    encodeHeight = 0;
     cc::VideoCodec codec = cc::VideoCodec::HEVC;
 };
 
@@ -45,6 +47,12 @@ CliArgs ParseArgs(int argc, char* argv[]) {
             if (strcmp(argv[i], "h264") == 0) args.codec = cc::VideoCodec::H264;
             else if (strcmp(argv[i], "hevc") == 0) args.codec = cc::VideoCodec::HEVC;
             else if (strcmp(argv[i], "av1") == 0) args.codec = cc::VideoCodec::AV1;
+        } else if (strcmp(argv[i], "--encode-resolution") == 0 && i + 1 < argc) {
+            ++i;
+            if (sscanf(argv[i], "%ux%u", &args.encodeWidth, &args.encodeHeight) != 2) {
+                fprintf(stderr, "Invalid resolution format: %s (expected WxH)\n", argv[i]);
+                exit(1);
+            }
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Couch Conduit Host v%u.%u.%u\n\n",
                    cc::kVersionMajor, cc::kVersionMinor, cc::kVersionPatch);
@@ -54,6 +62,7 @@ CliArgs ParseArgs(int argc, char* argv[]) {
             printf("  --bitrate <kbps>     Video bitrate in kbps (default: 20000)\n");
             printf("  --fps <fps>          Target framerate (default: 60)\n");
             printf("  --codec <codec>      Video codec: h264, hevc, av1 (default: hevc)\n");
+            printf("  --encode-resolution <WxH>  Encode resolution (default: capture res)\n");
             printf("  --help               Show this help\n");
             exit(0);
         }
@@ -96,6 +105,8 @@ int main(int argc, char* argv[]) {
     sessionConfig.video.fps         = args.fps;
     sessionConfig.video.bitrateKbps = args.bitrateKbps;
     sessionConfig.video.codec       = args.codec;
+    sessionConfig.encodeWidth       = args.encodeWidth;
+    sessionConfig.encodeHeight      = args.encodeHeight;
 
     if (!session->Init(sessionConfig)) {
         CC_FATAL("Host session initialization failed");

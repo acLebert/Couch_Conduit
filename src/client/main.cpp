@@ -25,7 +25,7 @@ static std::atomic<bool> g_running{true};
 static HWND g_hwnd = nullptr;
 static std::unique_ptr<cc::client::ClientSession> g_session;
 
-// Window procedure
+// Window procedure — forwards input events to ClientSession → InputCapture → Host
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CLOSE:
@@ -35,20 +35,94 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_KEYDOWN:
-            // TODO: Forward to InputCapture::OnKeyDown
+        case WM_SYSKEYDOWN:
+            // ESC to quit (client-only shortcut)
             if (wParam == VK_ESCAPE) {
                 g_running = false;
                 PostQuitMessage(0);
+                return 0;
+            }
+            // Forward all other keys to host
+            if (g_session && !(lParam & (1 << 30))) {  // Bit 30 = was already down (auto-repeat)
+                g_session->OnKeyDown(static_cast<uint16_t>(wParam));
             }
             return 0;
 
         case WM_KEYUP:
-            // TODO: Forward to InputCapture::OnKeyUp
+        case WM_SYSKEYUP:
+            if (g_session) {
+                g_session->OnKeyUp(static_cast<uint16_t>(wParam));
+            }
             return 0;
 
-        case WM_INPUT:
-            // TODO: Process raw input for mouse
+        case WM_LBUTTONDOWN:
+            if (g_session) g_session->OnMouseButton(0, true);
             return 0;
+        case WM_LBUTTONUP:
+            if (g_session) g_session->OnMouseButton(0, false);
+            return 0;
+        case WM_RBUTTONDOWN:
+            if (g_session) g_session->OnMouseButton(1, true);
+            return 0;
+        case WM_RBUTTONUP:
+            if (g_session) g_session->OnMouseButton(1, false);
+            return 0;
+        case WM_MBUTTONDOWN:
+            if (g_session) g_session->OnMouseButton(2, true);
+            return 0;
+        case WM_MBUTTONUP:
+            if (g_session) g_session->OnMouseButton(2, false);
+            return 0;
+        case WM_XBUTTONDOWN:
+            if (g_session) {
+                uint8_t btn = (GET_XBUTTON_WPARAM(wParam) == XBUTTON1) ? 3 : 4;
+                g_session->OnMouseButton(btn, true);
+            }
+            return TRUE;
+        case WM_XBUTTONUP:
+            if (g_session) {
+                uint8_t btn = (GET_XBUTTON_WPARAM(wParam) == XBUTTON1) ? 3 : 4;
+                g_session->OnMouseButton(btn, false);
+            }
+            return TRUE;
+
+        case WM_MOUSEWHEEL:
+            if (g_session) {
+                int16_t delta = static_cast<int16_t>(GET_WHEEL_DELTA_WPARAM(wParam));
+                g_session->OnMouseScroll(0, delta);
+            }
+            return 0;
+        case WM_MOUSEHWHEEL:
+            if (g_session) {
+                int16_t delta = static_cast<int16_t>(GET_WHEEL_DELTA_WPARAM(wParam));
+                g_session->OnMouseScroll(delta, 0);
+            }
+            return 0;
+
+        case WM_INPUT: {
+            // Raw Input for mouse — gives sub-pixel relative motion
+            UINT dataSize = 0;
+            GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam),
+                            RID_INPUT, nullptr, &dataSize, sizeof(RAWINPUTHEADER));
+            if (dataSize > 0 && dataSize <= 256) {
+                alignas(RAWINPUT) uint8_t buf[256];
+                if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam),
+                                    RID_INPUT, buf, &dataSize,
+                                    sizeof(RAWINPUTHEADER)) == dataSize) {
+                    RAWINPUT* raw = reinterpret_cast<RAWINPUT*>(buf);
+                    if (raw->header.dwType == RIM_TYPEMOUSE &&
+                        (raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
+                        if (g_session && (raw->data.mouse.lLastX != 0 || raw->data.mouse.lLastY != 0)) {
+                            g_session->OnMouseMove(
+                                static_cast<int16_t>(raw->data.mouse.lLastX),
+                                static_cast<int16_t>(raw->data.mouse.lLastY)
+                            );
+                        }
+                    }
+                }
+            }
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
 
         case WM_SIZE: {
             // TODO: Notify renderer of resize

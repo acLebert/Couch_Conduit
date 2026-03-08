@@ -40,9 +40,10 @@ D3D11Decoder::~D3D11Decoder() {
 }
 
 bool D3D11Decoder::Init(ID3D11Device* renderDevice, const Config& config,
-                         FrameDecodedCallback callback) {
+                         FrameDecodedCallback callback, IdrRequestCallback idrCallback) {
     m_config = config;
     m_callback = std::move(callback);
+    m_idrCallback = std::move(idrCallback);
     m_device = renderDevice;
 
     InitializeCriticalSectionAndSpinCount(&m_pendingLock, 4000);
@@ -103,6 +104,9 @@ bool D3D11Decoder::CreateDecoder() {
 
     m_packet = av_packet_alloc();
     m_frame = av_frame_alloc();
+
+    // Start in "waiting for IDR" state — drop all frames until we get one
+    m_needsIdr.store(true);
 
     CC_INFO("Video decoder opened: %s, hw=%s",
             codec->name,
@@ -199,6 +203,52 @@ void D3D11Decoder::DecodeLoop() {
         meta.decodeStartUs = decodeStart;
 
 #ifdef HAS_FFMPEG
+        // Detect IDR frame by scanning for HEVC NAL unit type
+        // HEVC NAL header: forbidden_zero_bit(1) nal_unit_type(6) nuh_layer_id(6) nuh_temporal_id_plus1(3)
+        // IDR_W_RADL = 19, IDR_N_LP = 20, SPS = 33, PPS = 34, VPS = 32
+        bool isIdrFrame = false;
+        if (frameData.size() >= 5) {
+            // Scan for NAL start codes (0x00 0x00 0x00 0x01 or 0x00 0x00 0x01)
+            for (size_t i = 0; i + 4 < frameData.size(); ++i) {
+                bool startCode3 = (frameData[i] == 0 && frameData[i+1] == 0 && frameData[i+2] == 1);
+                bool startCode4 = (i + 5 < frameData.size() && frameData[i] == 0 && frameData[i+1] == 0 && frameData[i+2] == 0 && frameData[i+3] == 1);
+
+                if (startCode4 || startCode3) {
+                    size_t nalStart = startCode4 ? i + 4 : i + 3;
+                    if (nalStart < frameData.size()) {
+                        uint8_t nalType = (frameData[nalStart] >> 1) & 0x3F;
+                        // VPS=32, SPS=33, PPS=34, IDR_W_RADL=19, IDR_N_LP=20
+                        if (nalType == 19 || nalType == 20 || nalType == 32 || nalType == 33 || nalType == 34) {
+                            isIdrFrame = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // If waiting for IDR, drop non-IDR frames
+        if (m_needsIdr.load()) {
+            if (!isIdrFrame) {
+                // Rate-limit IDR requests to at most once per 500ms
+                int64_t now = cc::NowUsec();
+                static int64_t lastIdrRequest = 0;
+                if (now - lastIdrRequest > 500000) {
+                    lastIdrRequest = now;
+                    CC_WARN("Waiting for IDR — dropping frame %u", meta.frameNumber);
+                    if (m_idrCallback) {
+                        m_idrCallback();
+                    }
+                }
+                continue;
+            }
+
+            // Got IDR! Flush decoder to clear any corrupt state, then decode
+            avcodec_flush_buffers(m_codecCtx);
+            m_needsIdr.store(false);
+            CC_INFO("IDR frame %u received — decoder flushed, starting clean decode", meta.frameNumber);
+        }
+
         // Decode
         AVFrame* decodedFrame = av_frame_alloc();
         if (DecodeFrame(frameData.data(), frameData.size(), decodedFrame)) {
@@ -222,6 +272,9 @@ void D3D11Decoder::DecodeLoop() {
             av_frame_free(&decodedFrame);
             m_needsIdr = true;
             CC_WARN("Decode failed for frame %u — requesting IDR", meta.frameNumber);
+            if (m_idrCallback) {
+                m_idrCallback();
+            }
         }
 #else
         // Stub: just pass metadata through

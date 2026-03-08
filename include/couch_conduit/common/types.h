@@ -81,6 +81,7 @@ enum class InputMessageType : uint8_t {
     ControllerConnected  = 0x10,
     ControllerDisconnect = 0x11,
     HapticFeedback       = 0x20,  // Host → Client
+    RequestIdr           = 0xF0,  // Client → Host: request IDR frame
 };
 
 struct GamepadState {

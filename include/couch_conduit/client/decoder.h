@@ -35,6 +35,9 @@ using FrameDecodedCallback = std::function<void(
     const FrameMetadata& meta
 )>;
 
+/// Callback to request IDR from host (on decode error or first connection)
+using IdrRequestCallback = std::function<void()>;
+
 /// D3D11VA hardware-accelerated video decoder.
 ///
 /// Key improvements over Moonlight:
@@ -58,7 +61,8 @@ public:
 
     /// Initialize decoder with a shared D3D11 device (same one used for rendering).
     /// This enables zero-copy decode→render.
-    bool Init(ID3D11Device* renderDevice, const Config& config, FrameDecodedCallback callback);
+    bool Init(ID3D11Device* renderDevice, const Config& config,
+              FrameDecodedCallback callback, IdrRequestCallback idrCallback = nullptr);
 
     /// Start the decode thread. It will wait on the frameReadyEvent
     /// signaled by the VideoReceiver.
@@ -90,6 +94,7 @@ private:
     ComPtr<ID3D11Device> m_device;
 
     FrameDecodedCallback m_callback;
+    IdrRequestCallback   m_idrCallback;
     Config               m_config;
 
     // Decode thread

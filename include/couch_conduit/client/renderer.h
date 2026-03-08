@@ -86,6 +86,11 @@ private:
     ComPtr<ID3D11ShaderResourceView> m_srvY;
     ComPtr<ID3D11ShaderResourceView> m_srvUV;
 
+    // NV12 staging texture with BIND_SHADER_RESOURCE for decoded frame copy
+    ComPtr<ID3D11Texture2D>          m_nv12Staging;
+    uint32_t                         m_nv12StagingW = 0;
+    uint32_t                         m_nv12StagingH = 0;
+
     Config m_config;
     bool   m_tearingSupported = false;
 

@@ -308,6 +308,17 @@ bool Renderer::Start() {
 }
 
 void Renderer::RenderLoop() {
+    // Stats tracking
+    int64_t statsInterval = 5000000;  // Report every 5 seconds
+    int64_t lastStatsTime = cc::NowUsec();
+    int64_t totalDecodeUs = 0;
+    int64_t totalRenderUs = 0;
+    int64_t totalHostProcUs = 0;
+    uint32_t frameCount = 0;
+    int64_t minPipelineUs = INT64_MAX;
+    int64_t maxPipelineUs = 0;
+    int64_t totalPipelineUs = 0;
+
     while (m_running) {
         // Wait for a frame to be submitted
         DWORD result = WaitForSingleObject(m_frameSubmittedEvent, 100);
@@ -354,6 +365,44 @@ void Renderer::RenderLoop() {
 
         meta.renderTimeUs = cc::NowUsec();
 
+        // Collect frame timing stats
+        if (meta.decodeStartUs > 0 && meta.decodeEndUs > 0) {
+            int64_t decodeUs = meta.decodeEndUs - meta.decodeStartUs;
+            int64_t renderUs = meta.renderTimeUs - meta.decodeEndUs;
+            totalDecodeUs += decodeUs;
+            totalRenderUs += renderUs;
+            frameCount++;
+
+            // Estimate pipeline latency from network receive to render complete
+            if (meta.recvTimeUs > 0) {
+                int64_t pipelineUs = meta.renderTimeUs - meta.recvTimeUs;
+                totalPipelineUs += pipelineUs;
+                minPipelineUs = (std::min)(minPipelineUs, pipelineUs);
+                maxPipelineUs = (std::max)(maxPipelineUs, pipelineUs);
+            }
+        }
+
+        // Periodic stats report
+        int64_t now = cc::NowUsec();
+        if (now - lastStatsTime > statsInterval && frameCount > 0) {
+            float avgDecodeMs = static_cast<float>(totalDecodeUs) / frameCount / 1000.0f;
+            float avgRenderMs = static_cast<float>(totalRenderUs) / frameCount / 1000.0f;
+            float avgPipelineMs = static_cast<float>(totalPipelineUs) / frameCount / 1000.0f;
+            float minPipelineMs = static_cast<float>(minPipelineUs) / 1000.0f;
+            float maxPipelineMs = static_cast<float>(maxPipelineUs) / 1000.0f;
+            float fps = static_cast<float>(frameCount) / ((now - lastStatsTime) / 1000000.0f);
+
+            CC_INFO("Pipeline stats: %.1f fps | decode=%.2fms | render=%.2fms | recv→present=%.2fms (min=%.2f max=%.2f)",
+                    fps, avgDecodeMs, avgRenderMs, avgPipelineMs, minPipelineMs, maxPipelineMs);
+
+            // Reset
+            totalDecodeUs = totalRenderUs = totalHostProcUs = totalPipelineUs = 0;
+            frameCount = 0;
+            minPipelineUs = INT64_MAX;
+            maxPipelineUs = 0;
+            lastStatsTime = now;
+        }
+
         // Deferred free of previous frame
         if (m_deferredFreeFrame) {
 #ifdef HAS_FFMPEG
@@ -393,40 +442,74 @@ void Renderer::RenderFrame(AVFrame* frame) {
             D3D11_TEXTURE2D_DESC desc;
             texture->GetDesc(&desc);
 
-            // Create Y plane SRV (R8_UNORM view of the NV12 luma)
-            D3D11_SHADER_RESOURCE_VIEW_DESC srvDescY = {};
-            srvDescY.Format = DXGI_FORMAT_R8_UNORM;
-            srvDescY.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-            srvDescY.Texture2DArray.MostDetailedMip = 0;
-            srvDescY.Texture2DArray.MipLevels = 1;
-            srvDescY.Texture2DArray.FirstArraySlice = subIndex;
-            srvDescY.Texture2DArray.ArraySize = 1;
+            CC_TRACE("Decoded texture: %ux%u, format=%u, bindFlags=0x%X, arraySize=%u, subIdx=%u",
+                     desc.Width, desc.Height, desc.Format, desc.BindFlags, desc.ArraySize, subIndex);
 
-            ComPtr<ID3D11ShaderResourceView> srvY;
-            HRESULT hr = m_device->CreateShaderResourceView(texture, &srvDescY, &srvY);
-            if (FAILED(hr)) {
-                CC_ERROR("Failed to create Y plane SRV: 0x%08X", hr);
-                return;
+            // Ensure we have a staging NV12 texture with BIND_SHADER_RESOURCE
+            // Re-create if dimensions/format changed
+            if (!m_nv12Staging || m_nv12StagingW != desc.Width || m_nv12StagingH != desc.Height) {
+                m_nv12Staging.Reset();
+                m_srvY.Reset();
+                m_srvUV.Reset();
+
+                D3D11_TEXTURE2D_DESC stagingDesc = {};
+                stagingDesc.Width = desc.Width;
+                stagingDesc.Height = desc.Height;
+                stagingDesc.MipLevels = 1;
+                stagingDesc.ArraySize = 1;
+                stagingDesc.Format = DXGI_FORMAT_NV12;
+                stagingDesc.SampleDesc.Count = 1;
+                stagingDesc.Usage = D3D11_USAGE_DEFAULT;
+                stagingDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+                HRESULT hr = m_device->CreateTexture2D(&stagingDesc, nullptr, &m_nv12Staging);
+                if (FAILED(hr)) {
+                    CC_ERROR("Failed to create NV12 staging texture: 0x%08X", hr);
+                    return;
+                }
+                m_nv12StagingW = desc.Width;
+                m_nv12StagingH = desc.Height;
+
+                CC_INFO("Created NV12 staging texture: %ux%u", desc.Width, desc.Height);
+
+                // Pre-create SRVs for the staging texture (they stay valid)
+                D3D11_SHADER_RESOURCE_VIEW_DESC srvDescY = {};
+                srvDescY.Format = DXGI_FORMAT_R8_UNORM;
+                srvDescY.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srvDescY.Texture2D.MostDetailedMip = 0;
+                srvDescY.Texture2D.MipLevels = 1;
+
+                hr = m_device->CreateShaderResourceView(m_nv12Staging.Get(), &srvDescY, &m_srvY);
+                if (FAILED(hr)) {
+                    CC_ERROR("Failed to create Y plane SRV: 0x%08X", hr);
+                    return;
+                }
+
+                D3D11_SHADER_RESOURCE_VIEW_DESC srvDescUV = {};
+                srvDescUV.Format = DXGI_FORMAT_R8G8_UNORM;
+                srvDescUV.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srvDescUV.Texture2D.MostDetailedMip = 0;
+                srvDescUV.Texture2D.MipLevels = 1;
+
+                hr = m_device->CreateShaderResourceView(m_nv12Staging.Get(), &srvDescUV, &m_srvUV);
+                if (FAILED(hr)) {
+                    CC_ERROR("Failed to create UV plane SRV: 0x%08X", hr);
+                    return;
+                }
+
+                CC_INFO("NV12 SRVs created for %ux%u", desc.Width, desc.Height);
             }
 
-            // Create UV plane SRV (R8G8_UNORM view of the NV12 chroma)
-            D3D11_SHADER_RESOURCE_VIEW_DESC srvDescUV = {};
-            srvDescUV.Format = DXGI_FORMAT_R8G8_UNORM;
-            srvDescUV.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-            srvDescUV.Texture2DArray.MostDetailedMip = 0;
-            srvDescUV.Texture2DArray.MipLevels = 1;
-            srvDescUV.Texture2DArray.FirstArraySlice = subIndex;
-            srvDescUV.Texture2DArray.ArraySize = 1;
-
-            ComPtr<ID3D11ShaderResourceView> srvUV;
-            hr = m_device->CreateShaderResourceView(texture, &srvDescUV, &srvUV);
-            if (FAILED(hr)) {
-                CC_ERROR("Failed to create UV plane SRV: 0x%08X", hr);
-                return;
-            }
+            // Copy decoded subresource → staging texture (single-element array, index 0)
+            m_context->CopySubresourceRegion(
+                m_nv12Staging.Get(), 0,   // dst: subresource 0
+                0, 0, 0,                  // dst offset
+                texture, subIndex,        // src: array slice from D3D11VA
+                nullptr                   // full subresource
+            );
 
             // Bind SRVs to pixel shader
-            ID3D11ShaderResourceView* srvs[] = { srvY.Get(), srvUV.Get() };
+            ID3D11ShaderResourceView* srvs[] = { m_srvY.Get(), m_srvUV.Get() };
             m_context->PSSetShaderResources(0, 2, srvs);
         }
     }

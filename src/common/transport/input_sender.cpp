@@ -56,6 +56,11 @@ void InputSender::SendMouseScroll(int16_t deltaX, int16_t deltaY) {
     SendInput(InputMessageType::MouseScroll, 0, &payload, sizeof(payload));
 }
 
+void InputSender::SendRequestIdr() {
+    // No payload needed — the message type is enough
+    SendInput(InputMessageType::RequestIdr, 0, nullptr, 0);
+}
+
 void InputSender::Shutdown() {
     m_socket.Close();
 }

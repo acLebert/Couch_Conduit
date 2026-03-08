@@ -198,6 +198,7 @@ public:
     void SendKeyboard(uint16_t vkCode, bool pressed);
     void SendMouseButton(uint8_t button, bool pressed);
     void SendMouseScroll(int16_t deltaX, int16_t deltaY);
+    void SendRequestIdr();
     void Shutdown();
 
 private:

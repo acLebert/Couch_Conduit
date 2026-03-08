@@ -35,7 +35,10 @@ bool ClientSession::Init(const Config& config) {
     auto onDecoded = [this](AVFrame* frame, const FrameMetadata& meta) {
         OnFrameDecoded(frame, meta);
     };
-    if (!m_decoder->Init(m_renderer->GetDevice(), decodeConfig, onDecoded)) {
+    auto onIdrNeeded = [this]() {
+        RequestIdr();
+    };
+    if (!m_decoder->Init(m_renderer->GetDevice(), decodeConfig, onDecoded, onIdrNeeded)) {
         CC_ERROR("Failed to init decoder");
         return false;
     }
@@ -64,24 +67,58 @@ bool ClientSession::Init(const Config& config) {
         return false;
     }
 
-    // Initialize input sender (for keyboard/mouse/gamepad → host)
-    m_inputSender = std::make_unique<transport::InputSender>();
-    if (!m_inputSender->Init(config.hostAddr, config.inputPort)) {
-        CC_WARN("Failed to init input sender — input forwarding disabled");
+    // Initialize input capture (XInput polling + keyboard/mouse forwarding → host)
+    m_inputCapture = std::make_unique<InputCapture>();
+    if (!m_inputCapture->Init(config.hostAddr, config.inputPort)) {
+        CC_WARN("Failed to init input capture — input forwarding disabled");
+    } else {
+        m_inputCapture->Start();
     }
 
     CC_INFO("Client session initialized: host=%s, video=%u, input=%u",
             config.hostAddr.c_str(), config.videoPort, config.inputPort);
+
+    // Request IDR immediately — we joined mid-stream and need SPS/PPS
+    RequestIdr();
+
     return true;
 }
 
 void ClientSession::Stop() {
+    if (m_inputCapture)   m_inputCapture->Stop();
     if (m_renderer)       m_renderer->Stop();
     if (m_decoder)        m_decoder->Stop();
     if (m_videoReceiver)  m_videoReceiver->Stop();
-    if (m_inputSender)    m_inputSender->Shutdown();
     CC_INFO("Client session stopped");
 }
+
+// ─── Input forwarding from WndProc → InputCapture → UDP → Host ─────────
+
+void ClientSession::OnKeyDown(uint16_t vkCode) {
+    if (m_inputCapture) m_inputCapture->OnKeyDown(vkCode);
+}
+
+void ClientSession::OnKeyUp(uint16_t vkCode) {
+    if (m_inputCapture) m_inputCapture->OnKeyUp(vkCode);
+}
+
+void ClientSession::OnMouseMove(int16_t dx, int16_t dy) {
+    if (m_inputCapture) m_inputCapture->OnMouseMove(dx, dy);
+}
+
+void ClientSession::OnMouseButton(uint8_t button, bool pressed) {
+    if (m_inputCapture) m_inputCapture->OnMouseButton(button, pressed);
+}
+
+void ClientSession::OnMouseScroll(int16_t dx, int16_t dy) {
+    if (m_inputCapture) m_inputCapture->OnMouseScroll(dx, dy);
+}
+
+void ClientSession::RequestIdr() {
+    if (m_inputCapture) m_inputCapture->SendRequestIdr();
+}
+
+// ─── Internal ──────────────────────────────────────────────────────────
 
 void ClientSession::OnFrameDecoded(AVFrame* frame, const FrameMetadata& meta) {
     // Submit decoded frame directly to renderer
