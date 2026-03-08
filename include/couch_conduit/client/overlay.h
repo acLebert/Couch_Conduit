@@ -72,9 +72,9 @@ public:
     void TogglePanel()  { m_showPanel = !m_showPanel; }
 
     /// Request disconnect — returns to connection screen
-    void RequestDisconnect() { m_disconnectRequested = true; }
-    bool IsDisconnectRequested() const { return m_disconnectRequested; }
-    void ResetDisconnect() { m_disconnectRequested = false; }
+    void RequestDisconnect() { m_disconnectRequested.store(true); }
+    bool IsDisconnectRequested() const { return m_disconnectRequested.load(); }
+    void ResetDisconnect() { m_disconnectRequested.store(false); }
 
     /// Check if overlay wants to capture mouse/keyboard
     bool WantCaptureMouse() const;
@@ -89,7 +89,7 @@ private:
     // Visibility
     bool m_showStats = true;   // Compact stats HUD (always on by default)
     bool m_showPanel = false;  // Full settings panel (toggled with F1)
-    bool m_disconnectRequested = false;  // Set by Disconnect button
+    std::atomic<bool> m_disconnectRequested{false};  // Set by Disconnect button
 
     // Stats (protected by mutex)
     std::mutex   m_statsMutex;

@@ -292,7 +292,7 @@ void Overlay::Draw() {
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.25f, 0.25f, 1.00f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.55f, 0.12f, 0.12f, 1.00f));
             if (ImGui::Button("DISCONNECT", ImVec2(-1, 36))) {
-                m_disconnectRequested = true;
+                m_disconnectRequested.store(true);
             }
             ImGui::PopStyleColor(3);
 

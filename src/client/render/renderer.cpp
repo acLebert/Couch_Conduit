@@ -194,8 +194,13 @@ bool Renderer::CreateSwapChain(HWND hwnd) {
     if (FAILED(hr)) return false;
 
     DXGI_SWAP_CHAIN_DESC1 desc = {};
-    desc.Width = m_config.width;
-    desc.Height = m_config.height;
+    // Use actual client area (DPI-scaled) instead of logical config dimensions
+    RECT clientRect;
+    GetClientRect(hwnd, &clientRect);
+    desc.Width  = static_cast<UINT>(clientRect.right  - clientRect.left);
+    desc.Height = static_cast<UINT>(clientRect.bottom - clientRect.top);
+    if (desc.Width  == 0) desc.Width  = m_config.width;
+    if (desc.Height == 0) desc.Height = m_config.height;
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count = 1;
     desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
