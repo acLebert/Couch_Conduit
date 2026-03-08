@@ -28,6 +28,16 @@ static std::unique_ptr<cc::client::ClientSession> g_session;
 
 // Window procedure — forwards input events to ClientSession → InputCapture → Host
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // Forward input to ImGui overlay first
+    if (g_session) {
+        auto* overlay = g_session->GetOverlay();
+        if (overlay && overlay->HandleInput(hwnd, msg, wParam, lParam)) {
+            // If overlay wants mouse/keyboard, don't forward to game input
+            if (overlay->WantCaptureMouse() || overlay->WantCaptureKeyboard())
+                return 0;
+        }
+    }
+
     switch (msg) {
         case WM_CLOSE:
         case WM_DESTROY:
@@ -42,6 +52,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_running = false;
                 PostQuitMessage(0);
                 return 0;
+            }
+            // F1 = toggle settings panel, F3 = toggle stats HUD
+            if (g_session) {
+                auto* overlay = g_session->GetOverlay();
+                if (overlay && !(lParam & (1 << 30))) {
+                    if (wParam == VK_F1) { overlay->TogglePanel(); return 0; }
+                    if (wParam == VK_F3) { overlay->ToggleStats(); return 0; }
+                }
             }
             // Forward all other keys to host
             if (g_session && !(lParam & (1 << 30))) {  // Bit 30 = was already down (auto-repeat)

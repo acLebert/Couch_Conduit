@@ -163,6 +163,10 @@ void ClientSession::RequestIdr() {
     if (m_inputCapture) m_inputCapture->SendRequestIdr();
 }
 
+Overlay* ClientSession::GetOverlay() {
+    return m_renderer ? m_renderer->GetOverlay() : nullptr;
+}
+
 // ─── Internal ──────────────────────────────────────────────────────────
 
 void ClientSession::OnFrameDecoded(AVFrame* frame, const FrameMetadata& meta) {

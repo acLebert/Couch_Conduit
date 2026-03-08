@@ -16,6 +16,7 @@
 #include <functional>
 
 #include <couch_conduit/common/types.h>
+#include <couch_conduit/client/overlay.h>
 
 // FFmpeg forward declaration
 extern "C" {
@@ -73,6 +74,12 @@ public:
     /// Get current render stats
     StreamStats GetStats() const;
 
+    /// Get the overlay (for forwarding WndProc input and toggling)
+    Overlay* GetOverlay() { return &m_overlay; }
+
+    /// Update overlay stats (thread-safe)
+    void UpdateOverlayStats(const OverlayStats& stats) { m_overlay.UpdateStats(stats); }
+
 private:
     ComPtr<ID3D11Device>           m_device;
     ComPtr<ID3D11DeviceContext>    m_context;
@@ -120,6 +127,8 @@ private:
     // Stats
     std::atomic<float> m_lastRenderTimeMs{0};
     std::atomic<uint32_t> m_renderedFps{0};
+
+    Overlay m_overlay;
 
     bool CreateDevice();
     bool CreateSwapChain(HWND hwnd);

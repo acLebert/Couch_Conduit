@@ -90,6 +90,11 @@ bool Renderer::Init(const Config& config) {
     if (!CreateSwapChain(config.hwnd)) return false;
     if (!CreateShaders()) return false;
 
+    // Initialize ImGui overlay
+    if (!m_overlay.Init(config.hwnd, m_device.Get(), m_context.Get())) {
+        CC_WARN("ImGui overlay init failed — continuing without overlay");
+    }
+
     CC_INFO("Renderer initialized: %ux%u, vsync=%s, tearing=%s",
             config.width, config.height,
             config.vsync ? "on" : "off",
@@ -351,6 +356,11 @@ void Renderer::RenderLoop() {
             RenderFrame(frame);
         }
 
+        // ── ImGui overlay (drawn after game frame, before Present) ──
+        m_overlay.NewFrame();
+        m_overlay.Draw();
+        m_overlay.Render();
+
         // Present with zero latency
         Present();
 
@@ -394,6 +404,18 @@ void Renderer::RenderLoop() {
 
             CC_INFO("Pipeline stats: %.1f fps | decode=%.2fms | render=%.2fms | recv→present=%.2fms (min=%.2f max=%.2f)",
                     fps, avgDecodeMs, avgRenderMs, avgPipelineMs, minPipelineMs, maxPipelineMs);
+
+            // Feed stats to ImGui overlay
+            {
+                OverlayStats os;
+                os.fps             = fps;
+                os.decodeTimeMs    = avgDecodeMs;
+                os.renderTimeMs    = avgRenderMs;
+                os.recvToPresentMs = avgPipelineMs;
+                os.minPipelineMs   = minPipelineMs;
+                os.maxPipelineMs   = maxPipelineMs;
+                m_overlay.UpdateStats(os);
+            }
 
             // Reset
             totalDecodeUs = totalRenderUs = totalHostProcUs = totalPipelineUs = 0;
@@ -581,6 +603,7 @@ void Renderer::Stop() {
     if (m_renderThread.joinable()) {
         m_renderThread.join();
     }
+    m_overlay.Shutdown();
 }
 
 }  // namespace cc::client

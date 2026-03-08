@@ -40,6 +40,9 @@ public:
     void OnMouseScroll(int16_t dx, int16_t dy);
     void RequestIdr();
 
+    /// Get the overlay (for forwarding WndProc input and toggling)
+    Overlay* GetOverlay();
+
 private:
     Config m_config;
     std::unique_ptr<Renderer>                   m_renderer;

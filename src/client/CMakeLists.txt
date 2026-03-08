@@ -1,15 +1,31 @@
+# ─── Dear ImGui (vendored) ──────────────────────────────────────────────
+set(IMGUI_DIR "${CMAKE_SOURCE_DIR}/third_party/imgui")
+set(IMGUI_SOURCES
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_demo.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_dx11.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
+)
+
 # Client binary
 add_executable(cc_client
     main.cpp
     decode/d3d11_decoder.cpp
     render/renderer.cpp
+    render/overlay.cpp
     input/input_capture.cpp
     audio/audio_player.cpp
     client_session.cpp
+    ${IMGUI_SOURCES}
 )
 
 target_include_directories(cc_client PRIVATE
     ${CMAKE_SOURCE_DIR}/include
+    ${IMGUI_DIR}
+    ${IMGUI_DIR}/backends
 )
 
 # FFmpeg (for D3D11VA decode)
