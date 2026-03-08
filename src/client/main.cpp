@@ -7,6 +7,7 @@
 
 #include <couch_conduit/common/types.h>
 #include <couch_conduit/common/transport.h>
+#include <couch_conduit/common/session.h>
 #include <couch_conduit/common/log.h>
 #include <couch_conduit/client/client_session.h>
 
@@ -182,6 +183,7 @@ struct CliArgs {
     uint32_t    height = 1080;
     bool        vsync = false;
     bool        fullscreen = false;
+    bool        noSession = false;
 };
 
 CliArgs ParseArgs(int argc, char* argv[]) {
@@ -198,6 +200,8 @@ CliArgs ParseArgs(int argc, char* argv[]) {
             args.vsync = true;
         } else if (strcmp(argv[i], "--fullscreen") == 0) {
             args.fullscreen = true;
+        } else if (strcmp(argv[i], "--no-session") == 0) {
+            args.noSession = true;
         } else if (strcmp(argv[i], "--resolution") == 0 && i + 1 < argc) {
             ++i;
             sscanf(argv[i], "%ux%u", &args.width, &args.height);
@@ -209,6 +213,7 @@ CliArgs ParseArgs(int argc, char* argv[]) {
             printf("  --port <port>          Video port (default: %u)\n", cc::kDefaultVideoPort);
             printf("  --vsync                Enable V-Sync (adds latency)\n");
             printf("  --fullscreen           Start in fullscreen mode\n");
+            printf("  --no-session           Skip TCP session (direct UDP)\n");
             printf("  --resolution <WxH>     Window resolution (default: 1920x1080)\n");
             printf("  --help                 Show this help\n");
             exit(0);
@@ -230,7 +235,7 @@ int main(int argc, char* argv[]) {
 
     CC_INFO("Couch Conduit Client v%u.%u.%u starting...",
             cc::kVersionMajor, cc::kVersionMinor, cc::kVersionPatch);
-    CC_INFO("Connecting to host: %s:%u", args.hostAddr.c_str(), args.port);
+    CC_INFO("Connecting to host: %s", args.hostAddr.c_str());
 
     // Initialize Winsock
     if (!cc::transport::InitWinsock()) {
@@ -238,27 +243,55 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Create window
-    g_hwnd = CreateGameWindow(args.width, args.height, args.fullscreen);
+    // Session negotiation variables
+    std::array<uint8_t, 16> sessionKey{};
+    bool encrypted = false;
+    uint32_t negotiatedWidth = args.width;
+    uint32_t negotiatedHeight = args.height;
+
+    if (!args.noSession) {
+        CC_INFO("Connecting to host via TCP session (ECDH key exchange)...");
+
+        cc::protocol::Session tcpSession;
+        cc::protocol::SessionConfig negotiated;
+
+        if (!tcpSession.ConnectToHost(args.hostAddr, cc::kDefaultControlPort,
+                                       negotiated, 10000)) {
+            CC_WARN("TCP session failed — falling back to direct UDP (no encryption)");
+        } else {
+            sessionKey = negotiated.sessionKey;
+            encrypted = true;
+            negotiatedWidth = negotiated.width;
+            negotiatedHeight = negotiated.height;
+            CC_INFO("Session established — %ux%u, encryption ON",
+                    negotiatedWidth, negotiatedHeight);
+        }
+    }
+
+    // Create window (use negotiated or CLI resolution)
+    g_hwnd = CreateGameWindow(negotiatedWidth, negotiatedHeight, args.fullscreen);
     if (!g_hwnd) {
         CC_FATAL("Failed to create window");
         return 1;
     }
 
-    CC_INFO("Window created: %ux%u, vsync=%s, fullscreen=%s",
-            args.width, args.height,
+    CC_INFO("Window created: %ux%u, vsync=%s, fullscreen=%s, encrypted=%s",
+            negotiatedWidth, negotiatedHeight,
             args.vsync ? "on" : "off",
-            args.fullscreen ? "yes" : "no");
+            args.fullscreen ? "yes" : "no",
+            encrypted ? "yes" : "no");
 
     // Create and initialize client session
     g_session = std::make_unique<cc::client::ClientSession>();
     cc::client::ClientSession::Config sessionConfig;
     sessionConfig.hostAddr      = args.hostAddr;
     sessionConfig.videoPort     = args.port;
-    sessionConfig.windowWidth   = args.width;
-    sessionConfig.windowHeight  = args.height;
+    sessionConfig.windowWidth   = negotiatedWidth;
+    sessionConfig.windowHeight  = negotiatedHeight;
     sessionConfig.vsync         = args.vsync;
     sessionConfig.hwnd          = g_hwnd;
+    sessionConfig.sessionKey    = sessionKey;
+    sessionConfig.encrypted     = encrypted;
 
     if (!g_session->Init(sessionConfig)) {
         CC_ERROR("Client session init failed — window will remain but no streaming");

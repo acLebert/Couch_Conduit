@@ -5,8 +5,13 @@ add_library(cc_common STATIC
     transport/video_receiver.cpp
     transport/input_sender.cpp
     transport/input_receiver.cpp
+    transport/audio_sender.cpp
+    transport/audio_receiver.cpp
+    transport/congestion.cpp
     protocol/session.cpp
     crypto/aes_gcm.cpp
+    fec/reed_solomon.cpp
+    net/stun.cpp
     util/system_tuning.cpp
 )
 

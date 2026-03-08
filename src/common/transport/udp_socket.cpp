@@ -4,6 +4,9 @@
 #include <couch_conduit/common/log.h>
 #include <couch_conduit/common/system_tuning.h>
 
+#include <cstring>
+#include <vector>
+
 namespace cc::transport {
 
 UdpSocket::~UdpSocket() {
@@ -60,6 +63,75 @@ int UdpSocket::Send(const void* data, size_t len) {
 int UdpSocket::SendTo(const void* data, size_t len, const sockaddr_in& addr) {
     return sendto(m_socket, static_cast<const char*>(data), static_cast<int>(len),
                   0, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+}
+
+int UdpSocket::SendBatch(const std::vector<std::pair<const void*, size_t>>& packets) {
+    if (packets.empty()) return 0;
+
+    // Try to use WSASendMsg for each packet with MSG_FASTOPEN-style batching.
+    // On Windows, true sendmmsg doesn't exist. We use tight loop with minimal
+    // syscall overhead by sending all packets without waiting for completion.
+    // The kernel will coalesce them into a single interrupt/submission.
+    //
+    // For true USO (UDP Segmentation Offload), we'd need UDP_SEND_MSG_SIZE
+    // with a single large buffer where the NIC splits into MTU-sized datagrams.
+    // That requires all packets to be same-destination & same-size, which fits
+    // our video frame fan-out pattern.
+
+    int sent = 0;
+
+    // Attempt USO if all packets are same size (common for video data packets)
+    bool allSameSize = true;
+    size_t firstLen = packets[0].second;
+    for (size_t i = 1; i < packets.size(); ++i) {
+        if (packets[i].second != firstLen) { allSameSize = false; break; }
+    }
+
+    if (allSameSize && packets.size() > 1) {
+        // Try UDP_SEND_MSG_SIZE (USO) — available on Windows 10 1903+
+        // This tells the NIC to segment a single large send into MSS-sized datagrams
+#ifndef UDP_SEND_MSG_SIZE
+#define UDP_SEND_MSG_SIZE 2
+#endif
+        DWORD segSize = static_cast<DWORD>(firstLen);
+        int rc = setsockopt(m_socket, IPPROTO_UDP, UDP_SEND_MSG_SIZE,
+                           reinterpret_cast<char*>(&segSize), sizeof(segSize));
+        if (rc == 0) {
+            // Build one big buffer
+            size_t totalLen = firstLen * packets.size();
+            std::vector<uint8_t> bigBuf(totalLen);
+            for (size_t i = 0; i < packets.size(); ++i) {
+                memcpy(bigBuf.data() + i * firstLen,
+                       packets[i].first, packets[i].second);
+            }
+
+            int result = sendto(m_socket, reinterpret_cast<char*>(bigBuf.data()),
+                               static_cast<int>(totalLen), 0,
+                               reinterpret_cast<sockaddr*>(&m_remote), sizeof(m_remote));
+            if (result > 0) {
+                // Reset USO segment size
+                segSize = 0;
+                setsockopt(m_socket, IPPROTO_UDP, UDP_SEND_MSG_SIZE,
+                          reinterpret_cast<char*>(&segSize), sizeof(segSize));
+                return static_cast<int>(packets.size());
+            }
+
+            // USO failed — fall through to individual sends
+            segSize = 0;
+            setsockopt(m_socket, IPPROTO_UDP, UDP_SEND_MSG_SIZE,
+                      reinterpret_cast<char*>(&segSize), sizeof(segSize));
+        }
+    }
+
+    // Fallback: tight loop of individual sends
+    for (auto& [data, len] : packets) {
+        int result = sendto(m_socket, static_cast<const char*>(data),
+                            static_cast<int>(len), 0,
+                            reinterpret_cast<sockaddr*>(&m_remote), sizeof(m_remote));
+        if (result > 0) ++sent;
+    }
+
+    return sent;
 }
 
 int UdpSocket::Recv(void* buf, size_t maxLen, sockaddr_in* fromAddr) {

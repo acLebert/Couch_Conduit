@@ -41,11 +41,54 @@ bool InputInjector::LoadViGEmApi() {
         return false;
     }
 
-    // TODO: Load function pointers:
-    // vigem_alloc, vigem_connect, vigem_target_x360_alloc,
-    // vigem_target_add, vigem_target_x360_update, etc.
+    // Load all function pointers
+    m_fn.alloc = reinterpret_cast<FnVigemAlloc>(
+        GetProcAddress(m_vigemLib, "vigem_alloc"));
+    m_fn.free = reinterpret_cast<FnVigemFree>(
+        GetProcAddress(m_vigemLib, "vigem_free"));
+    m_fn.connect = reinterpret_cast<FnVigemConnect>(
+        GetProcAddress(m_vigemLib, "vigem_connect"));
+    m_fn.disconnect = reinterpret_cast<FnVigemDisconnect>(
+        GetProcAddress(m_vigemLib, "vigem_disconnect"));
+    m_fn.target_x360_alloc = reinterpret_cast<FnVigemTargetX360Alloc>(
+        GetProcAddress(m_vigemLib, "vigem_target_x360_alloc"));
+    m_fn.target_free = reinterpret_cast<FnVigemTargetFree>(
+        GetProcAddress(m_vigemLib, "vigem_target_free"));
+    m_fn.target_add = reinterpret_cast<FnVigemTargetAdd>(
+        GetProcAddress(m_vigemLib, "vigem_target_add"));
+    m_fn.target_remove = reinterpret_cast<FnVigemTargetRemove>(
+        GetProcAddress(m_vigemLib, "vigem_target_remove"));
+    m_fn.target_x360_update = reinterpret_cast<FnVigemTargetX360Update>(
+        GetProcAddress(m_vigemLib, "vigem_target_x360_update"));
+    m_fn.target_x360_register_notification = reinterpret_cast<FnVigemX360RegisterNotify>(
+        GetProcAddress(m_vigemLib, "vigem_target_x360_register_notification"));
 
-    CC_INFO("ViGEmClient.dll loaded");
+    if (!m_fn.alloc || !m_fn.connect || !m_fn.target_x360_alloc ||
+        !m_fn.target_add || !m_fn.target_x360_update) {
+        CC_WARN("ViGEmClient.dll loaded but missing required functions");
+        FreeLibrary(m_vigemLib);
+        m_vigemLib = nullptr;
+        return false;
+    }
+
+    // Allocate and connect client
+    m_vigemClient = m_fn.alloc();
+    if (!m_vigemClient) {
+        CC_ERROR("vigem_alloc() returned null");
+        return false;
+    }
+
+    ULONG result = m_fn.connect(m_vigemClient);
+    // VIGEM_ERROR_NONE = 0x20000000
+    if (result != 0x20000000) {
+        CC_WARN("vigem_connect() failed: 0x%08X — ViGEmBus driver may not be installed", result);
+        m_fn.free(m_vigemClient);
+        m_vigemClient = nullptr;
+        return false;
+    }
+
+    m_vigemAvailable = true;
+    CC_INFO("ViGEmClient.dll loaded and connected to ViGEmBus driver");
     return true;
 }
 
@@ -60,13 +103,40 @@ bool InputInjector::ConnectController(uint8_t controllerId) {
         return true;  // Already connected
     }
 
-    // TODO: Create and plug in ViGEm virtual Xbox 360 controller
-    // slot.target = vigem_target_x360_alloc();
-    // vigem_target_add(m_vigemClient, slot.target);
-    // vigem_target_x360_register_notification(m_vigemClient, slot.target, rumbleCallback, this);
+    if (!m_vigemAvailable || !m_fn.target_x360_alloc || !m_fn.target_add) {
+        // ViGEm not available — mark as connected for state tracking but no real controller
+        slot.connected = true;
+        CC_INFO("Virtual controller %u connected (no ViGEm — state-only)", controllerId);
+        return true;
+    }
+
+    slot.target = m_fn.target_x360_alloc();
+    if (!slot.target) {
+        CC_ERROR("vigem_target_x360_alloc() returned null for controller %u", controllerId);
+        return false;
+    }
+
+    ULONG result = m_fn.target_add(m_vigemClient, slot.target);
+    // VIGEM_ERROR_NONE = 0x20000000
+    if (result != 0x20000000) {
+        CC_ERROR("vigem_target_add() failed for controller %u: 0x%08X", controllerId, result);
+        if (m_fn.target_free) m_fn.target_free(slot.target);
+        slot.target = nullptr;
+        return false;
+    }
+
+    // Register for rumble notifications if callback is set
+    if (m_rumbleCallback && m_fn.target_x360_register_notification) {
+        // NOTE: The real ViGEm callback has signature:
+        // void (PVIGEM_CLIENT, PVIGEM_TARGET, UCHAR largeMotor, UCHAR smallMotor, UCHAR led, void* userData)
+        // We store the controllerId in userData
+        m_fn.target_x360_register_notification(
+            m_vigemClient, slot.target, nullptr,
+            reinterpret_cast<void*>(static_cast<uintptr_t>(controllerId)));
+    }
 
     slot.connected = true;
-    CC_INFO("Virtual controller %u connected", controllerId);
+    CC_INFO("Virtual controller %u connected via ViGEmBus", controllerId);
     return true;
 }
 
@@ -76,11 +146,17 @@ void InputInjector::DisconnectController(uint8_t controllerId) {
     auto& slot = m_controllers[controllerId];
     if (!slot.connected) return;
 
-    // TODO: vigem_target_remove(m_vigemClient, slot.target);
-    // vigem_target_free(slot.target);
+    if (slot.target) {
+        if (m_vigemAvailable && m_fn.target_remove) {
+            m_fn.target_remove(m_vigemClient, slot.target);
+        }
+        if (m_fn.target_free) {
+            m_fn.target_free(slot.target);
+        }
+        slot.target = nullptr;
+    }
 
     slot.connected = false;
-    slot.target = nullptr;
     CC_INFO("Virtual controller %u disconnected", controllerId);
 }
 
@@ -95,17 +171,21 @@ void InputInjector::InjectGamepadState(const GamepadState& state) {
 
     slot.lastState = state;
 
-    // TODO: Convert to XUSB_REPORT and call vigem_target_x360_update()
-    //
-    // XUSB_REPORT report = {};
-    // report.wButtons = state.buttons;  // Map our button bits to XUSB bits
-    // report.bLeftTrigger = state.leftTrigger;
-    // report.bRightTrigger = state.rightTrigger;
-    // report.sThumbLX = state.leftStickX;
-    // report.sThumbLY = state.leftStickY;
-    // report.sThumbRX = state.rightStickX;
-    // report.sThumbRY = state.rightStickY;
-    // vigem_target_x360_update(m_vigemClient, slot.target, report);
+    // Update via ViGEm if available
+    if (m_vigemAvailable && slot.target && m_fn.target_x360_update) {
+        XusbReport report = {};
+        // Map our button bitmask to XUSB_GAMEPAD format
+        // Our buttons are already in XInput format, so direct assignment
+        report.wButtons      = state.buttons;
+        report.bLeftTrigger  = state.leftTrigger;
+        report.bRightTrigger = state.rightTrigger;
+        report.sThumbLX      = state.leftStickX;
+        report.sThumbLY      = state.leftStickY;
+        report.sThumbRX      = state.rightStickX;
+        report.sThumbRY      = state.rightStickY;
+
+        m_fn.target_x360_update(m_vigemClient, slot.target, report);
+    }
 }
 
 void InputInjector::InjectKeyboard(uint16_t vkCode, bool pressed) {
@@ -227,12 +307,20 @@ void InputInjector::Shutdown() {
         DisconnectController(i);
     }
 
+    if (m_vigemClient && m_fn.disconnect) {
+        m_fn.disconnect(m_vigemClient);
+    }
+    if (m_vigemClient && m_fn.free) {
+        m_fn.free(m_vigemClient);
+        m_vigemClient = nullptr;
+    }
+
     if (m_vigemLib) {
-        // TODO: vigem_disconnect(m_vigemClient); vigem_free(m_vigemClient);
         FreeLibrary(m_vigemLib);
         m_vigemLib = nullptr;
     }
 
+    m_vigemAvailable = false;
     CC_INFO("InputInjector shut down");
 }
 

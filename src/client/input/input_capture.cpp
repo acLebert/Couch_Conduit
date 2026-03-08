@@ -81,6 +81,10 @@ void InputCapture::SendRequestIdr() {
     CC_INFO("Sent IDR request to host");
 }
 
+void InputCapture::SetEncryptionKey(const uint8_t key[16]) {
+    m_sender.SetEncryptionKey(key);
+}
+
 void InputCapture::ControllerPollLoop() {
     // Track previous gamepad state to send only on change
     XINPUT_STATE prevState[4] = {};

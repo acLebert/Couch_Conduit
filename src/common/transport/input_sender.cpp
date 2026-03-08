@@ -13,6 +13,14 @@ bool InputSender::Init(const std::string& hostAddr, uint16_t hostPort) {
     return true;
 }
 
+void InputSender::SetEncryptionKey(const uint8_t key[16]) {
+    m_crypto = std::make_unique<crypto::AesGcm>();
+    if (!m_crypto->Init(key)) {
+        CC_ERROR("Failed to init AES-GCM for InputSender");
+        m_crypto.reset();
+    }
+}
+
 void InputSender::SendInput(InputMessageType type, uint8_t controllerId,
                             const void* payload, size_t payloadLen) {
     InputPacketHeader hdr = {};
@@ -20,14 +28,32 @@ void InputSender::SendInput(InputMessageType type, uint8_t controllerId,
     hdr.controllerId = controllerId;
     hdr.sequence = m_sequence++;
 
-    // TODO: Add AES-GCM encryption
-    // For now, send plaintext (development only)
+    if (m_crypto && payloadLen > 0) {
+        // Encrypt payload with AES-GCM
+        uint8_t nonce[12];
+        crypto::AesGcm::BuildNonce(nonce, 0x494E5054,  // 'INPT'
+                                   static_cast<uint32_t>(controllerId),
+                                   static_cast<uint32_t>(hdr.sequence));
+
+        std::vector<uint8_t> encrypted(payloadLen + crypto::AesGcm::kTagSize);
+        size_t encLen = m_crypto->Encrypt(nonce,
+            static_cast<const uint8_t*>(payload), payloadLen,
+            encrypted.data(), encrypted.size());
+        if (encLen > 0) {
+            std::vector<uint8_t> packet(sizeof(hdr) + encLen);
+            std::memcpy(packet.data(), &hdr, sizeof(hdr));
+            std::memcpy(packet.data() + sizeof(hdr), encrypted.data(), encLen);
+            m_socket.Send(packet.data(), packet.size());
+            return;
+        }
+    }
+
+    // Plaintext fallback
     std::vector<uint8_t> packet(sizeof(hdr) + payloadLen);
     std::memcpy(packet.data(), &hdr, sizeof(hdr));
     if (payloadLen > 0) {
         std::memcpy(packet.data() + sizeof(hdr), payload, payloadLen);
     }
-
     m_socket.Send(packet.data(), packet.size());
 }
 
@@ -59,6 +85,11 @@ void InputSender::SendMouseScroll(int16_t deltaX, int16_t deltaY) {
 void InputSender::SendRequestIdr() {
     // No payload needed — the message type is enough
     SendInput(InputMessageType::RequestIdr, 0, nullptr, 0);
+}
+
+void InputSender::SendRumble(uint8_t controllerId, uint8_t largeMotor, uint8_t smallMotor) {
+    struct { uint8_t large; uint8_t small; } payload = { largeMotor, smallMotor };
+    SendInput(InputMessageType::HapticFeedback, controllerId, &payload, sizeof(payload));
 }
 
 void InputSender::Shutdown() {

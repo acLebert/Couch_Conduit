@@ -19,7 +19,7 @@ Couch Conduit lets your friends connect with their controllers and play as Playe
 **Target latency:** < 10 ms input-to-photon on LAN, < 30 ms over decent internet.  
 **Measured:** 0.43 ms average recv-to-present on localhost (decode 0.24 ms + render 0.07 ms).
 
-> **Status:** Working end-to-end. Video streaming, input forwarding, and hardware encode/decode are fully functional. Audio streaming, encryption on the wire, and adaptive bitrate are on the roadmap.
+> **Status:** Fully featured. Video, audio, input, encryption, adaptive bitrate, Reed-Solomon FEC, multi-client, gamepad/haptics, and NAT traversal are all implemented and build-verified.
 
 ---
 
@@ -29,12 +29,21 @@ Couch Conduit lets your friends connect with their controllers and play as Playe
 - **NVENC hardware encode** — H.264 / HEVC / AV1, P1 ultra-low-latency preset, CBR
 - **D3D11VA hardware decode** — zero-copy decode via FFmpeg, event-signaled (no polling)
 - **D3D11 Video Processor** — GPU-accelerated downscale (e.g. 5120×1440 ultrawide → 1920×1080)
-- **Custom UDP/RTP transport** — RTP-like packetization with XOR forward error correction
+- **Custom UDP/RTP transport** — RTP-like packetization with Reed-Solomon FEC (multi-packet recovery)
 - **Full input chain** — XInput controllers at 1000 Hz, Raw Input mouse, keyboard → UDP → host `SendInput()`
+- **ViGEmBus virtual gamepad** — Full Xbox 360 controller injection with haptic/rumble feedback
 - **IDR feedback** — client detects corrupt/missing keyframes and requests instant IDR recovery
+- **TCP session + ECDH key exchange** — P-256 key agreement, session negotiation
+- **AES-128-GCM wire encryption** — All transport encrypted via Windows CNG BCrypt
+- **Audio streaming** — WASAPI loopback capture → UDP → shared-mode playback on client
+- **Adaptive bitrate** — GCC-like TWCC congestion control with delay-gradient analysis
+- **Adaptive FEC** — Loss-driven parity ratio adjustment in real time
+- **Multi-client support** — Up to 4 players, per-client transport and congestion state
+- **NAT traversal** — STUN (RFC 5389) public address discovery
+- **QoS / DSCP tagging** — EF (Expedited Forwarding) on all UDP sockets
+- **USO batched UDP sends** — UDP Segment Offload for reduced system call overhead
 - **Sub-millisecond system tuning** — 0.5 ms timer resolution, MMCSS Pro Audio, GPU REALTIME priority
 - **FLIP_DISCARD + ALLOW_TEARING** — tear-free or tear-allowed present depending on V-Sync setting
-- **AES-128-GCM encryption** — implemented via Windows CNG (not yet wired to the transport layer)
 - **Pipeline stats** — 5-second interval logging of FPS, decode time, render time, recv-to-present latency
 
 ## How It Works
@@ -84,10 +93,14 @@ Press **ESC** on the client to quit. See [TESTING.md](TESTING.md) for the full s
 
 | Port | Protocol | Direction | Purpose |
 |------|----------|-----------|---------|
-| 47101 | UDP | Host → Client | Video stream |
-| 47103 | UDP | Client → Host | Input + IDR requests |
+| 47100 | TCP | Bidirectional | Session negotiation + ECDH key exchange |
+| 47101 | UDP | Host → Client | Video stream (encrypted) |
+| 47102 | UDP | Host → Client | Audio stream (encrypted) |
+| 47103 | UDP | Client → Host | Input + IDR requests (encrypted) |
+| 47104 | UDP | Client → Host | Feedback (loss/TWCC reports) |
+| 47203+ | UDP | Host → Client | Haptic/rumble feedback (per-client) |
 
-Both machines must be on the same LAN, or these ports must be forwarded on the host's router for internet play. Wired ethernet is strongly recommended.
+Both machines must be on the same LAN, or these ports must be forwarded on the host's router for internet play. Use the built-in STUN client for NAT discovery. Wired ethernet is strongly recommended.
 
 ---
 
@@ -137,6 +150,31 @@ powershell -ExecutionPolicy Bypass -File scripts/package.ps1
 
 Creates `dist/CouchConduit-Host.zip` and `dist/CouchConduit-Client.zip` with all runtime dependencies bundled.
 
+### Installer
+
+Couch Conduit provides two installer options:
+
+**Inno Setup** (recommended — produces a standard Windows `.exe` installer):
+```powershell
+# Install Inno Setup 6.x from https://jrsoftware.org/isinfo.php
+iscc.exe installer\CouchConduit.iss
+# Output: dist\CouchConduit-0.1.0-x64-setup.exe
+```
+
+**WiX v4 MSI** (produces a `.msi` package):
+```powershell
+# Install WiX: dotnet tool install --global wix
+wix build installer\CouchConduit.wxs -o dist\CouchConduit-0.1.0-x64.msi
+```
+
+**Portable ZIP** (no installer needed):
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1
+# Output: dist\CouchConduit-0.1.0-x64.zip
+```
+
+All options bundle the executables, FFmpeg DLLs, and documentation. The Inno Setup installer also creates Start Menu shortcuts, adds to PATH, and checks for the ViGEmBus driver.
+
 ---
 
 ## CLI Reference
@@ -180,9 +218,9 @@ Creates `dist/CouchConduit-Host.zip` and `dist/CouchConduit-Client.zip` with all
 1. **Capture** — DXGI Desktop Duplication acquires the desktop as a GPU texture (zero-copy)
 2. **Downscale** — D3D11 Video Processor hardware-scales to encode resolution if needed
 3. **Encode** — NVENC encodes with P1 ultra-low-latency preset, async event-based output
-4. **Packetize** — RTP-style packetization with sequence numbers + XOR FEC parity packets
-5. **Transport** — Raw UDP on port 47101 (video) and 47103 (input)
-6. **Reassemble** — Client reassembles frame from packets, recovers single losses via XOR FEC
+4. **Packetize** — RTP-style packetization with sequence numbers + Reed-Solomon FEC parity shards
+5. **Transport** — AES-GCM encrypted UDP on ports 47101 (video), 47102 (audio), 47103 (input)
+6. **Reassemble** — Client reassembles frame from packets, recovers multi-packet losses via RS FEC
 7. **Decode** — D3D11VA hardware decode via FFmpeg, event-signaled (no polling)
 8. **Render** — NV12 → RGBA via HLSL pixel shader, presented with FLIP_DISCARD swap chain
 
@@ -204,7 +242,7 @@ Creates `dist/CouchConduit-Host.zip` and `dist/CouchConduit-Client.zip` with all
 | **Input-triggered capture** | Saves up to 16.7 ms vs. VBlank-only capture |
 | **Event-signaled decode** | Zero-wait vs. SDL's 2 ms polling sleep |
 | **FLIP_DISCARD + ALLOW_TEARING** | Eliminates compositor latency |
-| **XOR FEC** | Single-packet recovery with minimal overhead |
+| **Reed-Solomon FEC** | Multi-packet recovery with GF(2^8) Vandermonde matrix |
 | **IDR feedback channel** | Client requests keyframe on corruption instead of waiting |
 | **0.5 ms timer resolution** | `NtSetTimerResolution` for precise scheduling |
 | **Dynamic NVENC loading** | Graceful fallback if GPU doesn't support encode |
@@ -280,7 +318,7 @@ Couch_Conduit/
 | Encode | NVIDIA NVENC (dynamically loaded `nvEncodeAPI64.dll`) |
 | Decode | FFmpeg D3D11VA (`avcodec-62`, `avutil-60`) |
 | Render | Direct3D 11 — HLSL SM 5.0, FLIP_DISCARD, ALLOW_TEARING |
-| Transport | Raw UDP with RTP-style packetization, XOR FEC |
+| Transport | AES-GCM encrypted UDP with RTP packetization, Reed-Solomon FEC |
 | Input | XInput (controllers), Raw Input (mouse/keyboard), `SendInput()` |
 | Gamepad Injection | ViGEmBus (virtual Xbox 360 controller) |
 | Audio Capture | WASAPI loopback mode |
@@ -303,19 +341,19 @@ Couch_Conduit/
 - [x] Sub-millisecond system tuning
 - [x] AES-128-GCM implementation
 - [x] Packaging + distribution scripts
-- [ ] Wire-level encryption (AES-GCM on transport)
-- [ ] Audio streaming (WASAPI → Opus → UDP → client playback)
-- [ ] Adaptive bitrate (TWCC-style congestion control)
-- [ ] Adaptive FEC (loss-driven parity ratio)
-- [ ] TCP session negotiation + key exchange
-- [ ] Reed-Solomon FEC (multi-packet recovery)
-- [ ] ViGEmBus full gamepad injection
-- [ ] NAT traversal / STUN / TURN
-- [ ] Multi-client support (3-4 player couch co-op)
-- [ ] Haptic / rumble feedback
-- [ ] QoS / DSCP packet tagging
-- [ ] USO batched UDP sends
-- [ ] Installer / MSI packaging
+- [x] TCP session negotiation + ECDH P-256 key exchange
+- [x] Wire-level AES-GCM encryption on all transport
+- [x] Audio streaming (WASAPI loopback → UDP → client playback)
+- [x] ViGEmBus full gamepad injection (virtual Xbox 360 controller)
+- [x] Reed-Solomon FEC (multi-packet recovery)
+- [x] Adaptive FEC (loss-driven parity ratio)
+- [x] Adaptive bitrate (GCC-like TWCC congestion control)
+- [x] QoS / DSCP packet tagging (Expedited Forwarding)
+- [x] Multi-client support (up to 4-player couch co-op)
+- [x] NAT traversal / STUN (RFC 5389)
+- [x] Haptic / rumble feedback (XInput vibration)
+- [x] USO batched UDP sends
+- [x] Installer / MSI packaging (Inno Setup + WiX + portable ZIP)
 
 ---
 
@@ -326,8 +364,8 @@ Couch_Conduit/
 | Capture trigger | Timer-based, async from input | **Input-triggered** — frame captured on input arrival |
 | Decode wakeup | `SDL_Delay(2)` polling loop | **Event-signaled** — zero-wait decode |
 | Frame scheduling | Best-effort delivery | **Deadline-aware** — skip encode if frame will be late |
-| FEC | Static percentage overhead | **XOR FEC** now, adaptive ratio planned |
-| Bitrate | Fixed or manually capped | Dynamic `SetBitrate()`, TWCC planned |
+| FEC | Static percentage overhead | **Reed-Solomon FEC** with adaptive loss-driven ratio |
+| Bitrate | Fixed or manually capped | **GCC-like TWCC** adaptive bitrate with delay-gradient analysis |
 | Input thread | Shared with main/task pool | **Dedicated TIME_CRITICAL thread** |
 | Render present | Standard swap chain | **FLIP_DISCARD + ALLOW_TEARING** |
 | Timer resolution | System default (15.6 ms) | **0.5 ms** via `NtSetTimerResolution` |

@@ -59,6 +59,9 @@ public:
     /// Request IDR from host (on connect or decode error)
     void SendRequestIdr();
 
+    /// Enable encryption on the underlying InputSender
+    void SetEncryptionKey(const uint8_t key[16]);
+
 private:
     cc::transport::InputSender m_sender;
     std::thread m_controllerThread;

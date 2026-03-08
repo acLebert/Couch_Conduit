@@ -7,6 +7,7 @@
 
 #include <couch_conduit/common/types.h>
 #include <couch_conduit/common/transport.h>
+#include <couch_conduit/common/session.h>
 #include <couch_conduit/common/log.h>
 #include <couch_conduit/host/host_session.h>
 
@@ -24,12 +25,13 @@ void SignalHandler(int) {
 }
 
 struct CliArgs {
-    std::string clientHost = "127.0.0.1";
+    std::string clientHost;  // Empty = wait for TCP session
     uint32_t    bitrateKbps = 20000;
     uint32_t    fps = 60;
     uint32_t    encodeWidth = 0;   // 0 = same as capture
     uint32_t    encodeHeight = 0;
     cc::VideoCodec codec = cc::VideoCodec::HEVC;
+    bool        noSession = false;  // Skip TCP session negotiation
 };
 
 CliArgs ParseArgs(int argc, char* argv[]) {
@@ -53,19 +55,27 @@ CliArgs ParseArgs(int argc, char* argv[]) {
                 fprintf(stderr, "Invalid resolution format: %s (expected WxH)\n", argv[i]);
                 exit(1);
             }
+        } else if (strcmp(argv[i], "--no-session") == 0) {
+            args.noSession = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Couch Conduit Host v%u.%u.%u\n\n",
                    cc::kVersionMajor, cc::kVersionMinor, cc::kVersionPatch);
             printf("Usage: cc_host.exe [options]\n\n");
             printf("Options:\n");
-            printf("  --client <ip>        Client IP address (default: 127.0.0.1)\n");
+            printf("  --client <ip>        Client IP (default: wait for TCP session)\n");
             printf("  --bitrate <kbps>     Video bitrate in kbps (default: 20000)\n");
             printf("  --fps <fps>          Target framerate (default: 60)\n");
             printf("  --codec <codec>      Video codec: h264, hevc, av1 (default: hevc)\n");
             printf("  --encode-resolution <WxH>  Encode resolution (default: capture res)\n");
+            printf("  --no-session         Skip TCP session/key exchange (direct UDP)\n");
             printf("  --help               Show this help\n");
             exit(0);
         }
+    }
+
+    // Legacy mode requires --client
+    if (args.noSession && args.clientHost.empty()) {
+        args.clientHost = "127.0.0.1";
     }
 
     return args;
@@ -87,10 +97,6 @@ int main(int argc, char* argv[]) {
 
     CC_INFO("Couch Conduit Host v%u.%u.%u starting...",
             cc::kVersionMajor, cc::kVersionMinor, cc::kVersionPatch);
-    CC_INFO("Target: %s @ %u kbps, %u fps, codec=%s",
-            args.clientHost.c_str(), args.bitrateKbps, args.fps,
-            args.codec == cc::VideoCodec::HEVC ? "HEVC" :
-            args.codec == cc::VideoCodec::AV1  ? "AV1"  : "H.264");
 
     // Initialize Winsock
     if (!cc::transport::InitWinsock()) {
@@ -98,15 +104,62 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Create and initialize host session
-    auto session = std::make_unique<cc::host::HostSession>();
+    // Build host session config
     cc::host::HostSession::Config sessionConfig;
-    sessionConfig.clientHost        = args.clientHost;
     sessionConfig.video.fps         = args.fps;
     sessionConfig.video.bitrateKbps = args.bitrateKbps;
     sessionConfig.video.codec       = args.codec;
     sessionConfig.encodeWidth       = args.encodeWidth;
     sessionConfig.encodeHeight      = args.encodeHeight;
+
+    // TCP session negotiation (unless --no-session)
+    if (!args.noSession) {
+        CC_INFO("Waiting for client to connect via TCP session...");
+
+        cc::protocol::Session tcpSession;
+        cc::protocol::SessionConfig negotiated;
+        negotiated.width       = 1920;  // Defaults for the offer
+        negotiated.height      = 1080;
+        negotiated.fps         = args.fps;
+        negotiated.bitrateKbps = args.bitrateKbps;
+        negotiated.codec       = args.codec;
+
+        if (!tcpSession.HostListen(cc::kDefaultControlPort, negotiated)) {
+            CC_FATAL("Failed to start TCP session listener");
+            cc::transport::CleanupWinsock();
+            return 1;
+        }
+
+        CC_INFO("Listening on TCP port %u — waiting for client...", cc::kDefaultControlPort);
+
+        if (!tcpSession.AcceptClient(negotiated, 120000)) { // 2 min timeout
+            CC_FATAL("No client connected within timeout");
+            cc::transport::CleanupWinsock();
+            return 1;
+        }
+
+        // Use negotiated values
+        sessionConfig.clientHost       = negotiated.peerAddr;
+        sessionConfig.sessionKey       = negotiated.sessionKey;
+        sessionConfig.encrypted        = true;
+
+        CC_INFO("Session established with %s — encryption ON", negotiated.peerAddr.c_str());
+    } else {
+        // Legacy direct mode
+        sessionConfig.clientHost = args.clientHost;
+        sessionConfig.encrypted  = false;
+
+        CC_INFO("Direct mode: streaming to %s (no encryption)", args.clientHost.c_str());
+    }
+
+    CC_INFO("Target: %s @ %u kbps, %u fps, codec=%s, encrypted=%s",
+            sessionConfig.clientHost.c_str(), args.bitrateKbps, args.fps,
+            args.codec == cc::VideoCodec::HEVC ? "HEVC" :
+            args.codec == cc::VideoCodec::AV1  ? "AV1"  : "H.264",
+            sessionConfig.encrypted ? "yes" : "no");
+
+    // Create and initialize host session
+    auto session = std::make_unique<cc::host::HostSession>();
 
     if (!session->Init(sessionConfig)) {
         CC_FATAL("Host session initialization failed");
@@ -120,7 +173,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    CC_INFO("Streaming to %s — press Ctrl+C to stop", args.clientHost.c_str());
+    CC_INFO("Streaming to %s — press Ctrl+C to stop", sessionConfig.clientHost.c_str());
 
     while (g_running && session->IsStreaming()) {
         Sleep(100);

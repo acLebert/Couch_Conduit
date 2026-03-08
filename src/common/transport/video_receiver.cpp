@@ -2,6 +2,7 @@
 // Receives UDP/RTP video packets, reassembles frames, signals decoder
 
 #include <couch_conduit/common/transport.h>
+#include <couch_conduit/common/reed_solomon.h>
 #include <couch_conduit/common/log.h>
 
 #include <cstring>
@@ -37,17 +38,28 @@ bool VideoReceiver::Start(uint16_t port, FrameCallback callback) {
     return true;
 }
 
+void VideoReceiver::SetEncryptionKey(const uint8_t key[16]) {
+    m_crypto = std::make_unique<crypto::AesGcm>();
+    if (!m_crypto->Init(key)) {
+        CC_ERROR("Failed to init AES-GCM for VideoReceiver");
+        m_crypto.reset();
+    }
+}
+
 void VideoReceiver::RecvLoop() {
     std::vector<uint8_t> buf(kMaxPacketSize + 64);
 
-    // FEC recovery state per frame
-    struct FecGroup {
-        std::vector<uint8_t> parityData;
-        uint8_t groupStart = 0;
+    // RS FEC state per frame: store parity shards grouped by fecGroupId
+    struct RsFecState {
+        int dataShardCount = 0;
+        int parityShardCount = 0;
+        size_t shardSize = 0;
         uint8_t groupId = 0;
-        bool valid = false;
+        bool isRs = false;
+        std::vector<std::vector<uint8_t>> parityShards;  // indexed by fecIndex
+        std::vector<bool> parityPresent;
     };
-    std::vector<FecGroup> fecGroups;  // Indexed by fecGroupId
+    std::vector<RsFecState> fecStates(16);  // Circular buffer by groupId
 
     while (m_running) {
         int received = m_socket.Recv(buf.data(), buf.size());
@@ -70,16 +82,52 @@ void VideoReceiver::RecvLoop() {
         const uint8_t* payload = buf.data() + sizeof(VideoPacketHeader);
         size_t payloadLen = static_cast<size_t>(received) - sizeof(VideoPacketHeader);
 
+        // Decrypt payload if encryption is enabled
+        std::vector<uint8_t> decryptedBuf;
+        if (m_crypto && hdr.payloadType != 97) {  // Don't decrypt FEC packets yet
+            uint8_t nonce[12];
+            crypto::AesGcm::BuildNonce(nonce, hdr.ssrc,
+                                       static_cast<uint32_t>(hdr.frameNumber),
+                                       static_cast<uint32_t>(hdr.sequence));
+            decryptedBuf.resize(payloadLen);
+            size_t decLen = m_crypto->Decrypt(nonce, payload, payloadLen,
+                                              decryptedBuf.data(), decryptedBuf.size());
+            if (decLen > 0) {
+                payload = decryptedBuf.data();
+                payloadLen = decLen;
+            } else {
+                CC_WARN("Video packet decryption failed — seq=%u", hdr.sequence);
+                continue;
+            }
+        }
+
         // Store FEC packets for potential recovery
         if (hdr.payloadType == 97) {
-            // This is a FEC parity packet — store for recovery
-            size_t groupIdx = hdr.fecGroupId % 16;  // circular buffer
-            if (groupIdx >= fecGroups.size()) fecGroups.resize(groupIdx + 1);
-            auto& fg = fecGroups[groupIdx];
-            fg.parityData.assign(payload, payload + payloadLen);
-            fg.groupStart = hdr.flags;  // Group start index stored in flags
-            fg.groupId = hdr.fecGroupId;
-            fg.valid = true;
+            size_t gIdx = hdr.fecGroupId % 16;
+            auto& fs = fecStates[gIdx];
+
+            bool isRs = (hdr.flags & 0x04) != 0;
+            if (isRs) {
+                // RS FEC: totalPackets=k, packetIndex=m, fecIndex=parity shard index
+                int k = hdr.totalPackets;
+                int m = hdr.packetIndex;
+                int parityIdx = hdr.fecIndex;
+
+                fs.dataShardCount = k;
+                fs.parityShardCount = m;
+                fs.groupId = hdr.fecGroupId;
+                fs.isRs = true;
+                fs.shardSize = std::max(fs.shardSize, payloadLen);
+
+                if (static_cast<int>(fs.parityShards.size()) < m) {
+                    fs.parityShards.resize(m);
+                    fs.parityPresent.resize(m, false);
+                }
+                if (parityIdx < m) {
+                    fs.parityShards[parityIdx].assign(payload, payload + payloadLen);
+                    fs.parityPresent[parityIdx] = true;
+                }
+            }
             continue;
         }
 
@@ -87,12 +135,11 @@ void VideoReceiver::RecvLoop() {
 
         // New frame?
         if (hdr.frameNumber != m_currentFrame.frameNumber || !m_currentFrame.totalPackets) {
-            // If we had a partial previous frame, try FEC recovery then deliver
+            // If we had a partial previous frame, try RS FEC recovery then deliver
             if (m_currentFrame.receivedCount > 0 &&
                 m_currentFrame.receivedCount < m_currentFrame.totalPackets) {
 
-                // Attempt XOR FEC recovery if exactly one packet is missing in a group
-                TryFecRecovery(fecGroups);
+                TryRsFecRecovery(fecStates);
 
                 if (m_currentFrame.receivedCount == m_currentFrame.totalPackets) {
                     TryAssembleFrame();
@@ -131,51 +178,98 @@ void VideoReceiver::RecvLoop() {
 }
 
 template<typename T>
-void VideoReceiver::TryFecRecovery(T& fecGroups) {
-    // XOR-based FEC: if exactly one packet is missing from a FEC group,
-    // we can recover it by XOR-ing the parity with all received packets.
-    // This handles single-packet loss within a group cheaply.
+void VideoReceiver::TryRsFecRecovery(T& fecStates) {
+    // Find the FEC state matching the current frame's fecGroupId
+    // The current frame's packets were tagged with fecGroupId in the header.
+    // We scan all stored FEC states to find a matching one.
 
-    for (auto& fg : fecGroups) {
-        if (!fg.valid) continue;
+    for (auto& fs : fecStates) {
+        if (!fs.isRs || fs.dataShardCount == 0) continue;
 
-        uint8_t groupStart = fg.groupStart;
-        // Determine group end: next group start or end of frame
-        uint8_t groupEnd = m_currentFrame.totalPackets;
+        int k = fs.dataShardCount;
+        int m = fs.parityShardCount;
 
-        // Count missing in this group
-        int missingIdx = -1;
-        int missingCount = 0;
-        for (uint8_t i = groupStart; i < groupEnd && i < m_currentFrame.totalPackets; ++i) {
-            if (!m_currentFrame.received[i]) {
-                missingIdx = i;
-                missingCount++;
+        // Check our current frame has the right number of data slots
+        if (k != m_currentFrame.totalPackets) continue;
+
+        // Count missing data shards
+        int missingData = 0;
+        for (int i = 0; i < k; ++i) {
+            if (!m_currentFrame.received[i]) ++missingData;
+        }
+        if (missingData == 0) continue;  // Nothing to recover
+
+        // Count available parity shards
+        int availableParity = 0;
+        for (int i = 0; i < m && i < static_cast<int>(fs.parityPresent.size()); ++i) {
+            if (fs.parityPresent[i]) ++availableParity;
+        }
+
+        // RS can recover if (data present + parity present) >= k
+        int dataPresent = k - missingData;
+        if (dataPresent + availableParity < k) {
+            CC_WARN("RS: not enough shards for frame %u: data=%d/%d parity=%d/%d",
+                    m_currentFrame.frameNumber, dataPresent, k, availableParity, m);
+            continue;
+        }
+
+        // Build shards array: first k = data, next m = parity
+        int n = k + m;
+        size_t shardSize = fs.shardSize;
+
+        // Ensure shardSize covers all data packets too
+        for (int i = 0; i < k; ++i) {
+            if (m_currentFrame.received[i]) {
+                shardSize = std::max(shardSize, m_currentFrame.packets[i].size());
             }
         }
 
-        // XOR can only recover exactly 1 missing packet
-        if (missingCount != 1 || missingIdx < 0) continue;
+        std::vector<std::vector<uint8_t>> shards(n);
+        std::vector<bool> present(n, false);
 
-        // Recover: XOR parity with all received packets in the group
-        std::vector<uint8_t> recovered = fg.parityData;
-
-        for (uint8_t i = groupStart; i < groupEnd && i < m_currentFrame.totalPackets; ++i) {
-            if (i == static_cast<uint8_t>(missingIdx)) continue;
-            if (!m_currentFrame.received[i]) continue;
-
-            auto& pkt = m_currentFrame.packets[i];
-            for (size_t j = 0; j < std::min(recovered.size(), pkt.size()); ++j) {
-                recovered[j] ^= pkt[j];
+        // Data shards
+        for (int i = 0; i < k; ++i) {
+            if (m_currentFrame.received[i]) {
+                shards[i].resize(shardSize, 0);
+                std::memcpy(shards[i].data(),
+                           m_currentFrame.packets[i].data(),
+                           m_currentFrame.packets[i].size());
+                present[i] = true;
             }
         }
 
-        // Store recovered packet
-        m_currentFrame.packets[missingIdx] = std::move(recovered);
-        m_currentFrame.received[missingIdx] = true;
-        m_currentFrame.receivedCount++;
+        // Parity shards
+        for (int i = 0; i < m && i < static_cast<int>(fs.parityShards.size()); ++i) {
+            if (fs.parityPresent[i]) {
+                shards[k + i].resize(shardSize, 0);
+                std::memcpy(shards[k + i].data(),
+                           fs.parityShards[i].data(),
+                           std::min(fs.parityShards[i].size(), shardSize));
+                present[k + i] = true;
+            }
+        }
 
-        CC_DEBUG("FEC recovered packet %d of frame %u", missingIdx, m_currentFrame.frameNumber);
-        fg.valid = false;  // Used
+        // Attempt RS decode
+        fec::ReedSolomon rs(k, m);
+        if (rs.Decode(shards, present, shardSize)) {
+            // Copy recovered data shards back
+            for (int i = 0; i < k; ++i) {
+                if (!m_currentFrame.received[i]) {
+                    m_currentFrame.packets[i] = std::move(shards[i]);
+                    m_currentFrame.received[i] = true;
+                    m_currentFrame.receivedCount++;
+                    CC_DEBUG("RS recovered packet %d of frame %u", i, m_currentFrame.frameNumber);
+                }
+            }
+        } else {
+            CC_WARN("RS decode failed for frame %u (k=%d m=%d)",
+                    m_currentFrame.frameNumber, k, m);
+        }
+
+        // Mark used
+        fs.isRs = false;
+        fs.dataShardCount = 0;
+        break;
     }
 }
 

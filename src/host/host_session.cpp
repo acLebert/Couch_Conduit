@@ -6,6 +6,7 @@
 #include <couch_conduit/common/system_tuning.h>
 
 #include <algorithm>
+#include <cstring>
 
 namespace cc::host {
 
@@ -15,17 +16,31 @@ bool HostSession::Init(const Config& config) {
     // Apply system-level latency tuning
     cc::sys::ApplyLatencyTuning();
 
-    // Initialize input injector
+    // Initialize input injector with rumble callback
     m_inputInjector = std::make_unique<InputInjector>();
-    if (!m_inputInjector->Init()) {
-        CC_WARN("Input injector init failed — continuing without gamepad support");
-    }
+    auto rumbleCb = [this](uint8_t controllerId, uint8_t largeMotor, uint8_t smallMotor) {
+        // Send rumble/haptic feedback to all clients
+        #pragma pack(push, 1)
+        struct HapticMsg {
+            uint8_t msgType;       // InputMessageType::HapticFeedback
+            uint8_t controllerId;
+            uint8_t largeMotor;
+            uint8_t smallMotor;
+        };
+        #pragma pack(pop)
+        HapticMsg msg;
+        msg.msgType = static_cast<uint8_t>(InputMessageType::HapticFeedback);
+        msg.controllerId = controllerId;
+        msg.largeMotor = largeMotor;
+        msg.smallMotor = smallMotor;
 
-    // Initialize video sender (transport)
-    m_videoSender = std::make_unique<transport::VideoSender>();
-    if (!m_videoSender->Init(config.clientHost, config.clientVideoPort)) {
-        CC_ERROR("Failed to init video sender");
-        return false;
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        for (auto& client : m_clients) {
+            client->hapticSocket.Send(&msg, sizeof(msg));
+        }
+    };
+    if (!m_inputInjector->Init(rumbleCb)) {
+        CC_WARN("Input injector init failed — continuing without gamepad support");
     }
 
     // Initialize DXGI capture
@@ -75,14 +90,9 @@ bool HostSession::Init(const Config& config) {
         return false;
     }
 
-    // Initialize input receiver
-    m_inputReceiver = std::make_unique<transport::InputReceiver>();
-    auto onInput = [this](const transport::InputPacketHeader& hdr,
-                          const uint8_t* payload, size_t len) {
-        OnInputReceived(hdr, payload, len);
-    };
-    if (!m_inputReceiver->Start(config.inputListenPort, onInput)) {
-        CC_ERROR("Failed to start input receiver");
+    // Add the first client
+    if (!AddClient(config.clientHost, config.sessionKey, config.encrypted)) {
+        CC_ERROR("Failed to add initial client");
         return false;
     }
 
@@ -107,10 +117,31 @@ bool HostSession::Start() {
 
 void HostSession::Stop() {
     m_streaming = false;
-    if (m_inputReceiver)  m_inputReceiver->Stop();
+
+    // Stop all client feedback threads and transport
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        for (auto& client : m_clients) {
+            client->feedbackRunning = false;
+            if (client->feedbackThread.joinable()) client->feedbackThread.join();
+            client->feedbackSocket.Close();
+            if (client->inputReceiver) client->inputReceiver->Stop();
+            if (client->videoSender) client->videoSender->Shutdown();
+            if (client->audioSender) client->audioSender->Shutdown();
+        }
+        m_clients.clear();
+        m_videoSender = nullptr;
+        m_audioSender = nullptr;
+        m_inputReceiver = nullptr;
+    }
+
+    // Legacy feedback cleanup
+    m_feedbackRunning = false;
+    if (m_feedbackThread.joinable()) m_feedbackThread.join();
+    m_feedbackSocket.Close();
+
     if (m_capture)        m_capture->Stop();
     if (m_encoder)        m_encoder->Shutdown();
-    if (m_videoSender)    m_videoSender->Shutdown();
     if (m_inputInjector)  m_inputInjector->Shutdown();
     CC_INFO("Host session stopped");
 }
@@ -233,8 +264,13 @@ void HostSession::OnEncodeDone(uint32_t frameNum, const uint8_t* data, size_t le
     uint16_t hostProcTime = static_cast<uint16_t>(
         std::min<int64_t>((encEnd - encStart) / 100, UINT16_MAX));
 
-    // Send to client via UDP
-    m_videoSender->SendFrame(frameNum, data, len, isIdr, hostProcTime);
+    // Fan out to all connected clients
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    for (auto& client : m_clients) {
+        if (client->videoSender) {
+            client->videoSender->SendFrame(frameNum, data, len, isIdr, hostProcTime);
+        }
+    }
 }
 
 void HostSession::OnInputReceived(const transport::InputPacketHeader& hdr,
@@ -251,6 +287,177 @@ void HostSession::OnInputReceived(const transport::InputPacketHeader& hdr,
 
     // Trigger immediate screen capture (input-to-capture sync)
     m_capture->TriggerCapture();
+}
+
+bool HostSession::AddClient(const std::string& clientHost,
+                             const std::array<uint8_t, 16>& sessionKey,
+                             bool encrypted) {
+    auto client = std::make_unique<ClientState>();
+    client->clientHost = clientHost;
+
+    // Video sender
+    client->videoSender = std::make_unique<transport::VideoSender>();
+    if (!client->videoSender->Init(clientHost, m_config.clientVideoPort)) {
+        CC_ERROR("Failed to init video sender for client %s", clientHost.c_str());
+        return false;
+    }
+    if (encrypted) {
+        client->videoSender->SetEncryptionKey(sessionKey.data());
+    }
+
+    // Audio sender
+    client->audioSender = std::make_unique<transport::AudioSender>();
+    if (!client->audioSender->Init(clientHost, m_config.clientAudioPort)) {
+        CC_WARN("Audio sender failed for client %s", clientHost.c_str());
+        client->audioSender.reset();
+    } else if (encrypted) {
+        client->audioSender->SetEncryptionKey(sessionKey.data());
+    }
+
+    // Input receiver (per-client port: base + clientIndex)
+    client->inputReceiver = std::make_unique<transport::InputReceiver>();
+    uint16_t inputPort = m_config.inputListenPort;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        inputPort = static_cast<uint16_t>(m_config.inputListenPort + m_clients.size());
+    }
+    auto onInput = [this](const transport::InputPacketHeader& hdr,
+                          const uint8_t* payload, size_t len) {
+        OnInputReceived(hdr, payload, len);
+    };
+    if (!client->inputReceiver->Start(inputPort, onInput)) {
+        CC_WARN("Input receiver failed for client %s on port %u", clientHost.c_str(), inputPort);
+    } else if (encrypted) {
+        client->inputReceiver->SetEncryptionKey(sessionKey.data());
+    }
+
+    // Feedback receiver
+    uint16_t fbPort;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        fbPort = static_cast<uint16_t>(m_config.feedbackPort + m_clients.size());
+    }
+    if (client->feedbackSocket.Bind(fbPort)) {
+        client->feedbackSocket.SetRecvTimeout(100);
+        transport::CongestionEstimator::Config ccCfg;
+        ccCfg.startBitrateKbps = m_config.video.bitrateKbps;
+        client->congestion.Init(ccCfg);
+        client->feedbackRunning = true;
+    }
+
+    // Haptic/rumble sender (host → client, reuses input port + 100 offset)
+    uint16_t hapticPort;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        hapticPort = static_cast<uint16_t>(cc::kDefaultInputPort + 100 + m_clients.size());
+    }
+    client->hapticSocket.SetRemote(clientHost, hapticPort);
+
+    CC_INFO("Client added: %s (video=%u, audio=%u, input=%u, feedback=%u)",
+            clientHost.c_str(), m_config.clientVideoPort, m_config.clientAudioPort,
+            inputPort, fbPort);
+
+    // Store and set legacy aliases
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        m_clients.push_back(std::move(client));
+        if (m_clients.size() == 1) {
+            m_videoSender  = m_clients[0]->videoSender.get();
+            m_audioSender  = m_clients[0]->audioSender.get();
+            m_inputReceiver = m_clients[0]->inputReceiver.get();
+        }
+    }
+
+    return true;
+}
+
+void HostSession::FeedbackRecvLoop() {
+    alignas(8) uint8_t buf[1400];
+    while (m_feedbackRunning) {
+        int received = m_feedbackSocket.Recv(buf, sizeof(buf));
+        if (received < static_cast<int>(sizeof(transport::FeedbackPacket))) continue;
+
+        transport::FeedbackPacket fb;
+        std::memcpy(&fb, buf, sizeof(fb));
+
+        // Extract loss rate from lossMap
+        int receivedBits = 0;
+        uint64_t map = fb.lossMap;
+        while (map) { receivedBits += (map & 1); map >>= 1; }
+        float lossRate = 1.0f - static_cast<float>(receivedBits) / 64.0f;
+
+        // EWMA smoothing
+        m_measuredLossRate = m_measuredLossRate * 0.7f + lossRate * 0.3f;
+
+        // Feed loss to congestion estimator
+        m_congestion.OnLossUpdate(lossRate);
+
+        // Parse TWCC entries if present
+        int twccCount = fb.twccCount;
+        size_t twccOff = sizeof(transport::FeedbackPacket);
+        if (twccCount > 0 &&
+            received >= static_cast<int>(twccOff + twccCount * sizeof(transport::TwccEntry))) {
+            // We don't have host-side send timestamps readily available here,
+            // so we pass zero send times — the gradient estimator will skip those samples.
+            // A future refinement would log send timestamps per-sequence in VideoSender.
+            std::vector<uint16_t> seqs(twccCount);
+            std::vector<int64_t> sendTimes(twccCount, 0);
+            std::vector<int16_t> arrivalDeltas(twccCount);
+
+            for (int i = 0; i < twccCount; ++i) {
+                transport::TwccEntry entry;
+                std::memcpy(&entry, buf + twccOff + i * sizeof(transport::TwccEntry),
+                           sizeof(entry));
+                seqs[i] = entry.sequence;
+                arrivalDeltas[i] = entry.arrivalDelta;
+            }
+
+            m_congestion.OnTwccFeedback(seqs.data(), sendTimes.data(),
+                                        arrivalDeltas.data(), twccCount);
+        }
+
+        // Compute new bitrate from congestion estimator
+        uint32_t newBitrate = m_congestion.ComputeBitrate();
+        if (newBitrate > 0) {
+            std::lock_guard<std::mutex> lock(m_clientsMutex);
+            for (auto& client : m_clients) {
+                if (client->videoSender) {
+                    client->videoSender->SetTargetBitrateKbps(newBitrate);
+                }
+            }
+            // TODO: Reconfigure NVENC bitrate dynamically (encoder reconfig)
+        }
+
+        // Adjust FEC ratio periodically (every 500ms)
+        int64_t now = cc::NowUsec();
+        if (now - m_lastFecAdjustUs > 500000) {
+            AdjustFec(m_measuredLossRate);
+            m_lastFecAdjustUs = now;
+        }
+    }
+}
+
+void HostSession::AdjustFec(float lossRate) {
+    // Adaptive FEC: target FEC ratio = ~1.5x the measured loss rate
+    // with floor of 5% and ceiling of 40%
+    float targetRatio = lossRate * 1.5f;
+    targetRatio = std::max(0.05f, std::min(0.40f, targetRatio));
+
+    // Smooth adjustment (don't jump instantly)
+    m_fecRatio = m_fecRatio * 0.8f + targetRatio * 0.2f;
+
+    // Apply to all clients
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        for (auto& client : m_clients) {
+            if (client->videoSender) {
+                client->videoSender->SetFecRatio(m_fecRatio);
+            }
+        }
+    }
+
+    CC_TRACE("Adaptive FEC: loss=%.1f%% → fec=%.1f%%",
+             lossRate * 100.0f, m_fecRatio * 100.0f);
 }
 
 }  // namespace cc::host

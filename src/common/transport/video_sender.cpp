@@ -1,7 +1,8 @@
 // Couch Conduit — Video Sender (Host side)
-// Packetizes encoded frames and adds adaptive FEC
+// Packetizes encoded frames and adds Reed-Solomon FEC
 
 #include <couch_conduit/common/transport.h>
+#include <couch_conduit/common/reed_solomon.h>
 #include <couch_conduit/common/log.h>
 
 #include <algorithm>
@@ -23,6 +24,14 @@ bool VideoSender::Init(const std::string& clientHost, uint16_t clientPort) {
 
     CC_INFO("VideoSender initialized → %s:%u (ssrc=0x%08X)", clientHost.c_str(), clientPort, m_ssrc);
     return true;
+}
+
+void VideoSender::SetEncryptionKey(const uint8_t key[16]) {
+    m_crypto = std::make_unique<crypto::AesGcm>();
+    if (!m_crypto->Init(key)) {
+        CC_ERROR("Failed to init AES-GCM for VideoSender");
+        m_crypto.reset();
+    }
 }
 
 int VideoSender::SendFrame(uint32_t frameNumber, const uint8_t* data, size_t dataLen,
@@ -62,11 +71,40 @@ int VideoSender::SendFrame(uint32_t frameNumber, const uint8_t* data, size_t dat
         offset += chunkLen;
     }
 
-    // Send data packets
+    // Send data packets (batched for lower syscall overhead)
     int sentCount = 0;
+
+    // Build batch of encrypted packets
     for (auto& pkt : dataPackets) {
-        int sent = m_socket.Send(pkt.data(), pkt.size());
-        if (sent > 0) ++sentCount;
+        if (m_crypto) {
+            auto* hdrPtr = reinterpret_cast<VideoPacketHeader*>(pkt.data());
+            uint8_t* payload = pkt.data() + sizeof(VideoPacketHeader);
+            size_t payloadLen = pkt.size() - sizeof(VideoPacketHeader);
+
+            uint8_t nonce[12];
+            crypto::AesGcm::BuildNonce(nonce, m_ssrc,
+                                       static_cast<uint32_t>(hdrPtr->frameNumber),
+                                       static_cast<uint32_t>(hdrPtr->sequence));
+
+            std::vector<uint8_t> encrypted(payloadLen + crypto::AesGcm::kTagSize);
+            size_t encLen = m_crypto->Encrypt(nonce, payload, payloadLen,
+                                              encrypted.data(), encrypted.size());
+            if (encLen > 0) {
+                pkt.resize(sizeof(VideoPacketHeader) + encLen);
+                std::memcpy(pkt.data() + sizeof(VideoPacketHeader),
+                           encrypted.data(), encLen);
+            }
+        }
+    }
+
+    // Batch send all data packets
+    {
+        std::vector<std::pair<const void*, size_t>> batch;
+        batch.reserve(dataPackets.size());
+        for (auto& pkt : dataPackets) {
+            batch.emplace_back(pkt.data(), pkt.size());
+        }
+        sentCount = m_socket.SendBatch(batch);
     }
 
     // Generate and send FEC packets
@@ -88,47 +126,65 @@ int VideoSender::SendFrame(uint32_t frameNumber, const uint8_t* data, size_t dat
 
 std::vector<std::vector<uint8_t>> VideoSender::GenerateFec(
         const std::vector<std::vector<uint8_t>>& dataPackets) {
-    // Simple XOR-based FEC for now
-    // TODO: Replace with Reed-Solomon for multi-packet recovery
     std::vector<std::vector<uint8_t>> fecPackets;
 
-    int fecCount = std::max(1, static_cast<int>(dataPackets.size() * m_fecRatio));
+    int k = static_cast<int>(dataPackets.size());
+    if (k == 0) return fecPackets;
 
-    // Group data packets and XOR them together for each FEC packet
-    int groupSize = std::max(1, static_cast<int>(dataPackets.size()) / fecCount);
+    int m = std::max(1, static_cast<int>(k * m_fecRatio));
+    // Clamp to reasonable bounds (RS gets expensive at very high shard counts)
+    if (k + m > 255) m = 255 - k;
+    if (m <= 0) return fecPackets;
 
-    for (int g = 0; g < fecCount; ++g) {
-        int start = g * groupSize;
-        int end = std::min(start + groupSize, static_cast<int>(dataPackets.size()));
-        if (start >= static_cast<int>(dataPackets.size())) break;
+    // Determine uniform shard size (max payload across all packets)
+    size_t shardSize = 0;
+    for (auto& pkt : dataPackets) {
+        size_t payloadLen = pkt.size() - sizeof(VideoPacketHeader);
+        shardSize = std::max(shardSize, payloadLen);
+    }
+    if (shardSize == 0) return fecPackets;
 
-        // Find max packet size in this group
-        size_t maxLen = 0;
-        for (int i = start; i < end; ++i) {
-            maxLen = std::max(maxLen, dataPackets[i].size());
-        }
+    // Build data shard pointers (payload portion only, after header)
+    std::vector<const uint8_t*> dataPtrs(k);
+    std::vector<size_t> dataLens(k);
+    // We need to provide zero-padded copies so RS sees uniform shard sizes
+    std::vector<std::vector<uint8_t>> paddedShards(k);
+    for (int i = 0; i < k; ++i) {
+        size_t payloadLen = dataPackets[i].size() - sizeof(VideoPacketHeader);
+        paddedShards[i].resize(shardSize, 0);
+        std::memcpy(paddedShards[i].data(),
+                    dataPackets[i].data() + sizeof(VideoPacketHeader),
+                    payloadLen);
+        dataPtrs[i] = paddedShards[i].data();
+        dataLens[i] = shardSize;
+    }
 
-        // XOR all packets in the group
-        std::vector<uint8_t> fecData(maxLen, 0);
-        for (int i = start; i < end; ++i) {
-            for (size_t j = 0; j < dataPackets[i].size(); ++j) {
-                fecData[j] ^= dataPackets[i][j];
-            }
-        }
+    // Encode RS parity
+    fec::ReedSolomon rs(k, m);
+    std::vector<std::vector<uint8_t>> parityShards;
+    if (!rs.Encode(dataPtrs, dataLens, shardSize, parityShards)) {
+        CC_WARN("RS encode failed for k=%d m=%d", k, m);
+        return fecPackets;
+    }
 
-        // Create FEC packet header
+    // Wrap each parity shard in a FEC packet
+    fecPackets.reserve(m);
+    for (int p = 0; p < m; ++p) {
         VideoPacketHeader hdr = {};
         hdr.version      = 2;
         hdr.payloadType  = 97;  // FEC payload type
         hdr.sequence     = m_sequence++;
         hdr.ssrc         = m_ssrc;
         hdr.fecGroupId   = m_fecGroupId;
-        hdr.fecIndex     = 0xFF;  // Marks this as FEC parity
-        hdr.flags        = static_cast<uint8_t>(start);  // Group start index
+        hdr.fecIndex     = static_cast<uint8_t>(p);
+        hdr.totalPackets = static_cast<uint8_t>(k);   // data shard count
+        hdr.packetIndex  = static_cast<uint8_t>(m);   // parity shard count
+        hdr.flags        = 0x04;  // Bit 2: RS FEC (vs legacy XOR)
 
-        std::vector<uint8_t> packet(sizeof(hdr) + fecData.size());
+        std::vector<uint8_t> packet(sizeof(hdr) + parityShards[p].size());
         std::memcpy(packet.data(), &hdr, sizeof(hdr));
-        std::memcpy(packet.data() + sizeof(hdr), fecData.data(), fecData.size());
+        std::memcpy(packet.data() + sizeof(hdr),
+                    parityShards[p].data(), parityShards[p].size());
 
         fecPackets.push_back(std::move(packet));
     }

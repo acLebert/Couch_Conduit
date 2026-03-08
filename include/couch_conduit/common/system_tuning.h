@@ -43,7 +43,7 @@ inline void SetThreadPriorityLevel(int priority) {
 }
 
 /// Configure a UDP socket for low latency
-inline void ConfigureUdpSocket(SOCKET sock) {
+inline void ConfigureUdpSocket(SOCKET sock, int dscpValue = -1) {
     // Large send/receive buffers
     int bufSize = static_cast<int>(cc::kSocketBufferSize);
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&bufSize), sizeof(bufSize));
@@ -52,6 +52,21 @@ inline void ConfigureUdpSocket(SOCKET sock) {
     // Disable UDP checksum offload delay
     BOOL noDelay = TRUE;
     setsockopt(sock, IPPROTO_UDP, UDP_NOCHECKSUM, reinterpret_cast<char*>(&noDelay), sizeof(noDelay));
+
+    // Set DSCP / QoS tag via IP_TOS
+    // Windows maps DSCP to QWAVE priority classes. Set IP_TOS directly
+    // for routers that respect the field. DSCP is in bits 2-7 of TOS byte.
+    if (dscpValue < 0) {
+        // Default: DSCP EF (Expedited Forwarding, 46) for real-time traffic
+        dscpValue = 46;
+    }
+    int tosValue = dscpValue << 2;  // DSCP occupies upper 6 bits of TOS byte
+    if (setsockopt(sock, IPPROTO_IP, IP_TOS,
+                   reinterpret_cast<char*>(&tosValue), sizeof(tosValue)) == 0) {
+        CC_DEBUG("UDP socket DSCP set to %d (TOS=0x%02X)", dscpValue, tosValue);
+    } else {
+        CC_DEBUG("IP_TOS setsockopt failed: %d (may need admin or qWave policy)", WSAGetLastError());
+    }
 
     CC_DEBUG("UDP socket configured: bufSize=%d", bufSize);
 }

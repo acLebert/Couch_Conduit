@@ -77,6 +77,7 @@ private:
     // ViGEm (dynamically loaded)
     HMODULE        m_vigemLib = nullptr;
     PVIGEM_CLIENT  m_vigemClient = nullptr;
+    bool           m_vigemAvailable = false;
 
     struct ControllerSlot {
         PVIGEM_TARGET target = nullptr;
@@ -89,16 +90,43 @@ private:
 
     bool LoadViGEmApi();
 
-    // ViGEm function pointers (loaded at runtime)
+    // ViGEm function pointer types (ViGEmClient.h signatures)
+    using FnVigemAlloc               = PVIGEM_CLIENT(WINAPI*)();
+    using FnVigemFree                = void(WINAPI*)(PVIGEM_CLIENT);
+    using FnVigemConnect             = ULONG(WINAPI*)(PVIGEM_CLIENT);
+    using FnVigemDisconnect          = void(WINAPI*)(PVIGEM_CLIENT);
+    using FnVigemTargetX360Alloc     = PVIGEM_TARGET(WINAPI*)();
+    using FnVigemTargetFree          = void(WINAPI*)(PVIGEM_TARGET);
+    using FnVigemTargetAdd           = ULONG(WINAPI*)(PVIGEM_CLIENT, PVIGEM_TARGET);
+    using FnVigemTargetRemove        = ULONG(WINAPI*)(PVIGEM_CLIENT, PVIGEM_TARGET);
+
+    // XUSB_REPORT: { USHORT wButtons; BYTE bLeftTrigger, bRightTrigger;
+    //                SHORT sThumbLX, sThumbLY, sThumbRX, sThumbRY; }
+    struct XusbReport {
+        uint16_t wButtons;
+        uint8_t  bLeftTrigger;
+        uint8_t  bRightTrigger;
+        int16_t  sThumbLX;
+        int16_t  sThumbLY;
+        int16_t  sThumbRX;
+        int16_t  sThumbRY;
+    };
+    using FnVigemTargetX360Update    = ULONG(WINAPI*)(PVIGEM_CLIENT, PVIGEM_TARGET, XusbReport);
+
+    // Notification callback type: void (PVIGEM_CLIENT, PVIGEM_TARGET, UCHAR large, UCHAR small, UCHAR led, void* userData)
+    using FnVigemX360RegisterNotify  = ULONG(WINAPI*)(PVIGEM_CLIENT, PVIGEM_TARGET, void*, void*);
+
     struct ViGEmFunctions {
-        void* alloc = nullptr;
-        void* free = nullptr;
-        void* connect = nullptr;
-        void* target_x360_alloc = nullptr;
-        void* target_add = nullptr;
-        void* target_remove = nullptr;
-        void* target_x360_update = nullptr;
-        void* target_x360_register_notification = nullptr;
+        FnVigemAlloc              alloc = nullptr;
+        FnVigemFree               free = nullptr;
+        FnVigemConnect            connect = nullptr;
+        FnVigemDisconnect         disconnect = nullptr;
+        FnVigemTargetX360Alloc    target_x360_alloc = nullptr;
+        FnVigemTargetFree         target_free = nullptr;
+        FnVigemTargetAdd          target_add = nullptr;
+        FnVigemTargetRemove       target_remove = nullptr;
+        FnVigemTargetX360Update   target_x360_update = nullptr;
+        FnVigemX360RegisterNotify target_x360_register_notification = nullptr;
     } m_fn;
 };
 

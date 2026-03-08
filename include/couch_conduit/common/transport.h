@@ -15,8 +15,10 @@
 #include <thread>
 #include <memory>
 #include <mutex>
+#include <array>
 
 #include <couch_conduit/common/types.h>
+#include <couch_conduit/common/aes_gcm.h>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -55,8 +57,14 @@ struct FeedbackPacket {
     uint16_t decodeTimeUs       = 0;     // Last frame decode time
     uint16_t renderTimeUs       = 0;     // Last frame render time
     uint8_t  queueDepth         = 0;     // Frames waiting in decode/render queue
-    uint8_t  reserved           = 0;
-    // Followed by TWCC arrival timestamp array
+    uint8_t  twccCount          = 0;     // Number of TWCC entries following
+    // Followed by twccCount × TwccEntry structures
+};
+
+/// TWCC arrival timestamp entry — reports when a packet was received
+struct TwccEntry {
+    uint16_t sequence     = 0;  // Packet sequence number
+    int16_t  arrivalDelta = 0;  // Arrival time delta in 0.25ms units (relative to previous entry)
 };
 #pragma pack(pop)
 
@@ -80,6 +88,10 @@ public:
 
     /// Send data to a specific address
     int SendTo(const void* data, size_t len, const sockaddr_in& addr);
+
+    /// Batched send: send multiple packets in a single call using WSASendMsg.
+    /// Returns number of packets successfully sent.
+    int SendBatch(const std::vector<std::pair<const void*, size_t>>& packets);
 
     /// Receive data (blocking, with timeout)
     int Recv(void* buf, size_t maxLen, sockaddr_in* fromAddr = nullptr);
@@ -110,6 +122,9 @@ public:
     /// Initialize with remote client address
     bool Init(const std::string& clientHost, uint16_t clientPort);
 
+    /// Enable AES-128-GCM encryption with the given 16-byte key
+    void SetEncryptionKey(const uint8_t key[16]);
+
     /// Send an encoded video frame, packetizing and adding FEC
     /// Returns number of packets sent (data + FEC)
     int SendFrame(uint32_t frameNumber, const uint8_t* data, size_t dataLen,
@@ -121,6 +136,10 @@ public:
     /// Get current sequence number
     uint16_t GetSequence() const { return m_sequence; }
 
+    /// Set target bitrate for adaptive bitrate control
+    void SetTargetBitrateKbps(uint32_t kbps) { m_targetBitrateKbps = kbps; }
+    uint32_t GetTargetBitrateKbps() const { return m_targetBitrateKbps; }
+
     void Shutdown();
 
 private:
@@ -129,6 +148,9 @@ private:
     uint32_t   m_ssrc = 0;
     float      m_fecRatio = 0.10f;  // 10% FEC by default
     uint8_t    m_fecGroupId = 0;
+    uint32_t   m_targetBitrateKbps = 20000;
+
+    std::unique_ptr<crypto::AesGcm> m_crypto;
 
     /// Generate Reed-Solomon FEC packets for a set of data packets
     std::vector<std::vector<uint8_t>> GenerateFec(
@@ -148,6 +170,9 @@ public:
     /// Start receiving on the given port
     bool Start(uint16_t port, FrameCallback callback);
 
+    /// Enable AES-128-GCM decryption with the given 16-byte key
+    void SetEncryptionKey(const uint8_t key[16]);
+
     /// Signal that a complete frame is ready (for event-signaled decode)
     HANDLE GetFrameReadyEvent() const { return m_frameReady; }
 
@@ -159,6 +184,7 @@ private:
     std::atomic<bool> m_running{false};
     FrameCallback m_callback;
     HANDLE        m_frameReady = nullptr;
+    std::unique_ptr<crypto::AesGcm> m_crypto;
 
     // Frame reassembly state
     struct PendingFrame {
@@ -179,31 +205,29 @@ private:
     void TryAssembleFrame();
 
     // FEC recovery support
-    struct FecGroup {
-        std::vector<uint8_t> parityData;
-        uint8_t groupStart = 0;
-        uint8_t groupId = 0;
-        bool valid = false;
-    };
     template<typename T>
-    void TryFecRecovery(T& fecGroups);
+    void TryRsFecRecovery(T& fecStates);
 };
 
 // ─── Input Sender (Client side) ────────────────────────────────────────
 class InputSender {
 public:
     bool Init(const std::string& hostAddr, uint16_t hostPort);
+    void SetEncryptionKey(const uint8_t key[16]);
     void SendGamepadState(const GamepadState& state);
     void SendMouseMotion(int16_t dx, int16_t dy);
     void SendKeyboard(uint16_t vkCode, bool pressed);
     void SendMouseButton(uint8_t button, bool pressed);
     void SendMouseScroll(int16_t deltaX, int16_t deltaY);
+    void SendMouseScroll(int16_t delta); // vertical only
     void SendRequestIdr();
+    void SendRumble(uint8_t controllerId, uint8_t largeMotor, uint8_t smallMotor);
     void Shutdown();
 
 private:
     UdpSocket m_socket;
     uint16_t  m_sequence = 0;
+    std::unique_ptr<crypto::AesGcm> m_crypto;
 
     void SendInput(InputMessageType type, uint8_t controllerId,
                    const void* payload, size_t payloadLen);
@@ -216,6 +240,7 @@ public:
                                              const uint8_t* payload, size_t len)>;
 
     bool Start(uint16_t port, InputCallback callback);
+    void SetEncryptionKey(const uint8_t key[16]);
     void Stop();
 
     /// Event signaled when input arrives — can be used to trigger capture
@@ -227,6 +252,44 @@ private:
     std::atomic<bool> m_running{false};
     InputCallback m_callback;
     HANDLE        m_inputArrived = nullptr;
+    std::unique_ptr<crypto::AesGcm> m_crypto;
+
+    void RecvLoop();
+};
+
+// ─── Audio Sender (Host side) ──────────────────────────────────────────
+class AudioSender {
+public:
+    bool Init(const std::string& clientHost, uint16_t clientPort);
+    void SetEncryptionKey(const uint8_t key[16]);
+
+    /// Send audio samples (float PCM, interleaved channels)
+    void SendAudio(const float* samples, uint32_t frameCount,
+                   uint32_t sampleRate, uint32_t channels);
+    void Shutdown();
+
+private:
+    UdpSocket m_socket;
+    uint32_t  m_sequence = 0;
+    std::unique_ptr<crypto::AesGcm> m_crypto;
+};
+
+// ─── Audio Receiver (Client side) ──────────────────────────────────────
+class AudioReceiver {
+public:
+    using AudioCallback = std::function<void(const float* samples, uint32_t frameCount,
+                                             uint32_t sampleRate, uint32_t channels)>;
+
+    bool Start(uint16_t port, AudioCallback callback);
+    void SetEncryptionKey(const uint8_t key[16]);
+    void Stop();
+
+private:
+    UdpSocket     m_socket;
+    std::thread   m_recvThread;
+    std::atomic<bool> m_running{false};
+    AudioCallback m_callback;
+    std::unique_ptr<crypto::AesGcm> m_crypto;
 
     void RecvLoop();
 };
