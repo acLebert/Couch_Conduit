@@ -25,6 +25,7 @@
 static std::atomic<bool> g_running{true};
 static HWND g_hwnd = nullptr;
 static std::unique_ptr<cc::client::ClientSession> g_session;
+static bool g_inSizeMove = false;  // True while user is dragging/resizing the window
 
 // Window procedure — forwards input events to ClientSession → InputCapture → Host
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -119,11 +120,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_INPUT: {
-            // Raw Input for mouse — gives sub-pixel relative motion
-            // Only forward when our window is the foreground window to prevent
-            // feedback loops (especially on localhost where host SendInput
-            // generates new Raw Input events).
-            if (GetForegroundWindow() != hwnd) {
+            // Raw Input for mouse — gives sub-pixel relative motion.
+            //
+            // CRITICAL: Two guards prevent a feedback loop on localhost:
+            //  1. Skip events with hDevice==0 — those are synthetic events
+            //     injected by SendInput() on the host side. Physical mice
+            //     always have a non-zero device handle.
+            //  2. Skip events while the user is dragging/resizing the window
+            //     (WM_ENTERSIZEMOVE modal loop) — mouse deltas during a
+            //     window drag should not be forwarded to the host.
+            if (g_inSizeMove) {
                 return DefWindowProcW(hwnd, msg, wParam, lParam);
             }
             UINT dataSize = 0;
@@ -136,6 +142,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                     sizeof(RAWINPUTHEADER)) == dataSize) {
                     RAWINPUT* raw = reinterpret_cast<RAWINPUT*>(buf);
                     if (raw->header.dwType == RIM_TYPEMOUSE &&
+                        raw->header.hDevice != nullptr &&  // Filter injected (SendInput) events
                         (raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
                         if (g_session && (raw->data.mouse.lLastX != 0 || raw->data.mouse.lLastY != 0)) {
                             g_session->OnMouseMove(
@@ -148,6 +155,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return DefWindowProcW(hwnd, msg, wParam, lParam);
         }
+
+        case WM_ENTERSIZEMOVE:
+            g_inSizeMove = true;
+            return 0;
+        case WM_EXITSIZEMOVE:
+            g_inSizeMove = false;
+            return 0;
 
         case WM_SIZE: {
             // TODO: Notify renderer of resize
