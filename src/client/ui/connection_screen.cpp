@@ -104,11 +104,19 @@ ConnectionResult ShowConnectionScreen(HWND hwnd,
     ConnectionResult result;
     s_quit = false;
 
+    // Get actual client area (accounts for DPI scaling)
+    RECT clientRect;
+    GetClientRect(hwnd, &clientRect);
+    uint32_t actualWidth  = static_cast<uint32_t>(clientRect.right  - clientRect.left);
+    uint32_t actualHeight = static_cast<uint32_t>(clientRect.bottom - clientRect.top);
+    if (actualWidth  == 0) actualWidth  = width;
+    if (actualHeight == 0) actualHeight = height;
+
     // ── D3D11 device + swap chain ──────────────────────────────────────
     DXGI_SWAP_CHAIN_DESC scd = {};
     scd.BufferCount                  = 1;
-    scd.BufferDesc.Width             = width;
-    scd.BufferDesc.Height            = height;
+    scd.BufferDesc.Width             = actualWidth;
+    scd.BufferDesc.Height            = actualHeight;
     scd.BufferDesc.Format            = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.BufferDesc.RefreshRate       = {60, 1};
     scd.BufferUsage                  = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -186,9 +194,12 @@ ConnectionResult ShowConnectionScreen(HWND hwnd,
         ImGui::NewFrame();
 
         // ── Centered panel ─────────────────────────────────────────────
+        // Use ImGui's actual display size (DPI-aware) rather than the
+        // logical width/height passed in, so hit-testing matches visuals.
+        const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
         const ImVec2 panelSize(460.0f, roomCodesEnabled ? 510.0f : 370.0f);
-        const ImVec2 panelPos((float)width  * 0.5f - panelSize.x * 0.5f,
-                              (float)height * 0.5f - panelSize.y * 0.5f);
+        const ImVec2 panelPos(displaySize.x * 0.5f - panelSize.x * 0.5f,
+                              displaySize.y * 0.5f - panelSize.y * 0.5f);
 
         ImGui::SetNextWindowPos(panelPos, ImGuiCond_Always);
         ImGui::SetNextWindowSize(panelSize, ImGuiCond_Always);
