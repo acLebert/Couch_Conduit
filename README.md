@@ -5,6 +5,7 @@
   </p>
   <p align="center">
     <a href="#quick-start">Quick Start</a> •
+    <a href="#download">Download</a> •
     <a href="#building-from-source">Build</a> •
     <a href="#architecture">Architecture</a> •
     <a href="TESTING.md">Testing Guide</a> •
@@ -19,7 +20,7 @@ Couch Conduit lets your friends connect with their controllers and play as Playe
 **Target latency:** < 10 ms input-to-photon on LAN, < 30 ms over decent internet.  
 **Measured:** 0.43 ms average recv-to-present on localhost (decode 0.24 ms + render 0.07 ms).
 
-> **Status:** Fully featured. Video, audio, input, encryption, adaptive bitrate, Reed-Solomon FEC, multi-client, gamepad/haptics, and NAT traversal are all implemented and build-verified.
+> **Status:** Fully featured. Video, audio, input, encryption, adaptive bitrate, Reed-Solomon FEC, multi-client, gamepad/haptics, NAT traversal, room-code signaling, and a Dear ImGui connection/overlay UI are all implemented and build-verified.
 
 ---
 
@@ -45,6 +46,10 @@ Couch Conduit lets your friends connect with their controllers and play as Playe
 - **Sub-millisecond system tuning** — 0.5 ms timer resolution, MMCSS Pro Audio, GPU REALTIME priority
 - **FLIP_DISCARD + ALLOW_TEARING** — tear-free or tear-allowed present depending on V-Sync setting
 - **Pipeline stats** — 5-second interval logging of FPS, decode time, render time, recv-to-present latency
+- **Dear ImGui overlay** — amber/dark theme HUD with real-time stats (F3) and settings panel (F1)
+- **Connection screen UI** — graphical join screen with room code and direct-IP input (no CLI needed)
+- **Room code signaling** — 6-character room codes via Cloudflare Worker, so friends can connect without knowing your IP
+- **Disconnect / reconnect** — F4 or in-panel button returns to connection screen without restarting
 
 ## How It Works
 
@@ -71,23 +76,80 @@ HOST                                          CLIENT
 
 **Key innovation:** When input arrives from the client, the host captures a frame *immediately* instead of waiting for the next VBlank timer — cutting up to 16.7 ms of latency.
 
+## Download
+
+Grab the latest **CouchConduit-v0.1.0-win64.zip** from [Releases](https://github.com/acLebert/Couch_Conduit/releases) or build from source (see below).
+
+The ZIP contains everything both sides need — just unzip and go:
+
+| File | Purpose |
+|------|---------|
+| `Start-Host.bat` | One-click host launcher |
+| `Start-Client.bat` | One-click client launcher |
+| `cc_host.exe` | Host binary |
+| `cc_client.exe` | Client binary + connection screen |
+| `avcodec-62.dll` / `avutil-60.dll` / `swresample-6.dll` | FFmpeg (needed by client) |
+| `vc_redist.x64.exe` | Visual C++ runtime installer (run once if needed) |
+| `README.txt` | Quick-start guide |
+
+> **First time?** If you get a "VCRUNTIME140.dll not found" error, run `vc_redist.x64.exe` from the ZIP.
+
+---
+
 ## Quick Start
 
-### Pre-built Binaries
+### Host (the PC running the game)
 
-Download the latest zips from [Releases](https://github.com/acLebert/Couch_Conduit/releases) or build from source (see below). The host zip is ~0.3 MB, client zip is ~35 MB (includes FFmpeg DLLs).
+Double-click **Start-Host.bat** (or run `cc_host.exe` from a terminal).
 
-**Host (the PC running the game):**
-```powershell
-.\cc_host.exe --client <CLIENT_IP> --encode-resolution 1920x1080
+It will print your **Local IP** and start listening for clients:
+
+```
+  ========================================
+  ===       COUCH CONDUIT HOST         ===
+  ========================================
+
+  Local IP  : 192.168.1.42:47100
+
+  Waiting for client to connect via TCP session...
 ```
 
-**Client (your friend's PC):**
+Share your IP with your friend. Press **Ctrl+C** to stop.
+
+### Client (your friend's PC)
+
+Double-click **Start-Client.bat** (or run `cc_client.exe`).
+
+A connection screen appears with two options:
+- **Direct IP** — type the host's IP address and click **CONNECT**
+- **Room Code** — type a 6-character room code and click **JOIN** (requires `--signaling-server` on both sides)
+
+### In-Game Controls
+
+| Key | Action |
+|-----|--------|
+| **F1** | Toggle settings panel (has a DISCONNECT button) |
+| **F3** | Toggle real-time stats overlay (FPS, latency, bitrate) |
+| **F4** | Quick disconnect (returns to connection screen) |
+| **ESC** | Quit entirely |
+
+### Room Codes (optional)
+
+If you deploy the included Cloudflare Worker signaling server (`server/`), both host and client can use room codes so your friend never needs to know your IP:
+
 ```powershell
-.\cc_client.exe <HOST_IP> --resolution 1920x1080
+# Host
+cc_host.exe --signaling-server https://your-worker.workers.dev
+
+# Client
+cc_client.exe --signaling-server https://your-worker.workers.dev
 ```
 
-Press **ESC** on the client to quit. See [TESTING.md](TESTING.md) for the full step-by-step guide.
+The host prints a 6-character room code; the client types it in and clicks JOIN.
+
+You can also set the `CC_SIGNALING_URL` environment variable instead of passing the flag.
+
+See [TESTING.md](TESTING.md) for the full step-by-step testing guide.
 
 ### Network Requirements
 
@@ -100,7 +162,7 @@ Press **ESC** on the client to quit. See [TESTING.md](TESTING.md) for the full s
 | 47104 | UDP | Client → Host | Feedback (loss/TWCC reports) |
 | 47203+ | UDP | Host → Client | Haptic/rumble feedback (per-client) |
 
-Both machines must be on the same LAN, or these ports must be forwarded on the host's router for internet play. Use the built-in STUN client for NAT discovery. Wired ethernet is strongly recommended.
+Both machines must be on the same LAN, or these ports must be forwarded on the host's router for internet play. Use the built-in STUN client + room codes for NAT discovery (no port forwarding needed in many cases). Wired ethernet is strongly recommended.
 
 ---
 
@@ -148,7 +210,7 @@ Binaries are produced at `build/src/host/Release/cc_host.exe` and `build/src/cli
 powershell -ExecutionPolicy Bypass -File scripts/package.ps1
 ```
 
-Creates `dist/CouchConduit-Host.zip` and `dist/CouchConduit-Client.zip` with all runtime dependencies bundled.
+Creates `dist/CouchConduit-v0.1.0-win64.zip` (~60 MB) containing both executables, FFmpeg DLLs, VC redistributable, launcher scripts, and a README.
 
 ### Installer
 
@@ -183,21 +245,26 @@ All options bundle the executables, FFmpeg DLLs, and documentation. The Inno Set
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--client <IP>` | `127.0.0.1` | Client's IP address |
-| `--encode-resolution <WxH>` | *(capture res)* | Encode resolution (GPU downscale if different from desktop) |
 | `--bitrate <kbps>` | `20000` | Video bitrate |
 | `--fps <N>` | `60` | Target framerate |
 | `--codec <h264\|hevc\|av1>` | `hevc` | Video codec |
+| `--encode-resolution <WxH>` | *(capture res)* | Encode resolution (GPU downscale if different from desktop) |
+| `--signaling-server <url>` | *(none)* | Enable room codes via signaling server |
+| `--no-session` | off | Skip TCP session (direct UDP, no encryption) |
+| `--client <IP>` | *(auto)* | Legacy: specify client IP directly |
 
 ### Client (`cc_client.exe`)
 
+With no arguments, opens the graphical **connection screen**. Pass a host IP to connect directly.
+
 | Flag | Default | Description |
 |------|---------|-------------|
-| `<HOST_IP>` (positional) | `127.0.0.1` | Host's IP address |
-| `--port <N>` | `47101` | Video port |
+| `<HOST_IP>` (positional) | *(none)* | Host IP — skips connection screen |
 | `--resolution <WxH>` | `1920x1080` | Window resolution |
 | `--fullscreen` | off | Start in fullscreen |
 | `--vsync` | off | Enable V-Sync (adds latency) |
+| `--signaling-server <url>` | *(none)* | Enable room code lookup |
+| `--no-session` | off | Skip TCP session (direct UDP, no encryption) |
 
 ### Bitrate Guide
 
@@ -261,12 +328,17 @@ Couch_Conduit/
 ├── docs/
 │   └── ARCHITECTURE.md               # Deep-dive: wire protocol, threading, latency budget
 ├── scripts/
-│   └── package.ps1                   # Build + package distributable zips
+│   ├── package.ps1                   # Build + package distributable ZIP
+│   └── dist-assets/                  # Launcher BATs + README bundled in ZIP
+├── server/
+│   └── src/index.ts                  # Cloudflare Worker signaling server (room codes)
 │
 ├── include/couch_conduit/
 │   ├── common/
 │   │   ├── types.h                   # VideoConfig, FrameMetadata, GamepadState, ports
 │   │   ├── transport.h               # UdpSocket, Video/Input Sender/Receiver, FEC
+│   │   ├── signaling.h               # WinHTTP signaling client (room codes)
+│   │   ├── stun.h                    # STUN client (RFC 5389)
 │   │   ├── log.h                     # CC_INFO / CC_ERROR / CC_TRACE macros
 │   │   └── system_tuning.h           # Timer resolution, MMCSS, GPU priority
 │   ├── host/
@@ -278,28 +350,32 @@ Couch_Conduit/
 │       ├── client_session.h          # Orchestrator: recv → decode → render
 │       ├── decoder.h                 # D3D11Decoder — FFmpeg D3D11VA
 │       ├── renderer.h               # D3D11 swap chain + NV12→RGBA shader
+│       ├── overlay.h                # Dear ImGui overlay (stats HUD + settings)
+│       ├── connection_screen.h      # Graphical connection UI
 │       └── input_capture.h          # XInput + Raw Input capture
 │
 ├── src/
 │   ├── common/                       # cc_common static library
 │   │   ├── transport/                # UDP socket, video/input send/recv, FEC
-│   │   ├── protocol/                 # Session negotiation (stub)
+│   │   ├── net/                      # Signaling client, STUN client
+│   │   ├── protocol/                 # TCP session negotiation + ECDH
 │   │   ├── crypto/                   # AES-128-GCM via Windows CNG
 │   │   └── util/                     # System tuning, timer resolution
 │   ├── host/                         # cc_host executable
-│   │   ├── main.cpp                  # CLI parsing, signal handling
+│   │   ├── main.cpp                  # CLI parsing, STUN + room code, signal handling
 │   │   ├── host_session.cpp          # Session orchestrator
 │   │   ├── capture/                  # DXGI Desktop Duplication
 │   │   ├── encode/                   # NVENC encoder
 │   │   ├── input/                    # Input injection (SendInput + ViGEmBus)
 │   │   └── audio/                    # WASAPI loopback capture
 │   └── client/                       # cc_client executable
-│       ├── main.cpp                  # Window creation, WndProc, message loop
+│       ├── main.cpp                  # Window, WndProc, connection loop
 │       ├── client_session.cpp        # Session orchestrator
 │       ├── decode/                   # D3D11VA decoder
-│       ├── render/                   # D3D11 renderer + HLSL shaders
+│       ├── render/                   # D3D11 renderer + ImGui overlay
+│       ├── ui/                       # Connection screen (Dear ImGui)
 │       ├── input/                    # XInput + Raw Input
-│       └── audio/                    # Audio player (stub)
+│       └── audio/                    # WASAPI audio player
 │
 └── third_party/
     ├── ffmpeg/                       # FFmpeg shared libs (not committed)
@@ -324,6 +400,9 @@ Couch_Conduit/
 | Audio Capture | WASAPI loopback mode |
 | Encryption | AES-128-GCM via Windows CNG (`bcrypt.h`) |
 | Scheduling | MMCSS Pro Audio, `NtSetTimerResolution(0.5ms)`, D3DKMT GPU REALTIME |
+| Overlay UI | Dear ImGui (vendored) — DX11 + Win32 backends |
+| Signaling | Cloudflare Worker + KV (room codes) |
+| HTTP Client | WinHTTP (native, no dependencies) |
 | COM | WRL `ComPtr` smart pointers |
 
 ---
@@ -354,6 +433,11 @@ Couch_Conduit/
 - [x] Haptic / rumble feedback (XInput vibration)
 - [x] USO batched UDP sends
 - [x] Installer / MSI packaging (Inno Setup + WiX + portable ZIP)
+- [x] Dear ImGui overlay (amber/dark theme, stats HUD, settings panel)
+- [x] Connection screen UI (graphical room code + direct IP input)
+- [x] Room code signaling (Cloudflare Worker + WinHTTP client)
+- [x] Disconnect / reconnect flow (F4 hotkey + in-panel button)
+- [x] Single-ZIP distribution (host + client + FFmpeg + VC redist + launchers)
 
 ---
 
