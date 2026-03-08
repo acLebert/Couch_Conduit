@@ -45,10 +45,16 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float  y  = texY.Sample(samp, input.uv);
     float2 uv = texUV.Sample(samp, input.uv);
 
-    // BT.709 YCbCr → RGB  (uv.x = U/Cb, uv.y = V/Cr)
-    float r = y + 1.5748 * (uv.y - 0.5);
-    float g = y - 0.1873 * (uv.x - 0.5) - 0.4681 * (uv.y - 0.5);
-    float b = y + 1.8556 * (uv.x - 0.5);
+    // BT.709 limited-range (studio swing) NV12 → full-range RGB
+    // NVENC outputs Y:[16-235] UV:[16-240] mapped to [0,1]
+    // uv.x = U/Cb (blue-difference), uv.y = V/Cr (red-difference)
+    float y_scaled = 1.16438 * (y - 0.0625);
+    float cb = uv.x - 0.5;
+    float cr = uv.y - 0.5;
+
+    float r = y_scaled + 1.79274 * cr;
+    float g = y_scaled - 0.21325 * cb - 0.53291 * cr;
+    float b = y_scaled + 2.11240 * cb;
 
     return float4(saturate(r), saturate(g), saturate(b), 1.0);
 }
