@@ -40,7 +40,7 @@ public:
 
         // Controller polling thread — 1000Hz
         m_controllerThread = std::thread([this]() {
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGH);
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
             ControllerPollLoop();
         });
 

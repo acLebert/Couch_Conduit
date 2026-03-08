@@ -14,12 +14,9 @@
 
 #include <couch_conduit/common/types.h>
 
-// Forward declarations for NVENC types (from nvEncodeAPI.h)
-// We load NVENC dynamically to avoid hard SDK dependency at compile time
-struct NV_ENCODE_API_FUNCTION_LIST;
-typedef void* NV_ENC_REGISTERED_PTR;
-typedef void* NV_ENC_INPUT_PTR;
-typedef void* NV_ENC_OUTPUT_PTR;
+#ifdef HAS_NVENC
+#include <nvEncodeAPI.h>
+#endif
 
 namespace cc::host {
 
@@ -83,7 +80,8 @@ public:
 private:
     // NVENC API (dynamically loaded)
     HMODULE                       m_nvencLib = nullptr;
-    NV_ENCODE_API_FUNCTION_LIST*  m_nvenc = nullptr;
+#ifdef HAS_NVENC
+    NV_ENCODE_API_FUNCTION_LIST   m_nvenc = {};
     void*                         m_encoder = nullptr;
 
     // D3D11 resources
@@ -91,9 +89,17 @@ private:
     NV_ENC_REGISTERED_PTR         m_registeredInput = nullptr;
 
     // Encode resources
-    NV_ENC_INPUT_PTR              m_inputBuffer = nullptr;
+    NV_ENC_INPUT_PTR              m_mappedInput = nullptr;
     NV_ENC_OUTPUT_PTR             m_outputBuffer = nullptr;
     HANDLE                        m_completionEvent = nullptr;
+#else
+    void*                         m_encoder = nullptr;
+    ID3D11Device*                 m_device = nullptr;
+    void*                         m_registeredInput = nullptr;
+    void*                         m_mappedInput = nullptr;
+    void*                         m_outputBuffer = nullptr;
+    HANDLE                        m_completionEvent = nullptr;
+#endif
 
     EncodeDoneCallback            m_callback;
     Config                        m_config;

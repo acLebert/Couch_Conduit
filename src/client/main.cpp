@@ -8,6 +8,7 @@
 #include <couch_conduit/common/types.h>
 #include <couch_conduit/common/transport.h>
 #include <couch_conduit/common/log.h>
+#include <couch_conduit/client/client_session.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -18,9 +19,11 @@
 #include <cstring>
 #include <string>
 #include <atomic>
+#include <memory>
 
 static std::atomic<bool> g_running{true};
 static HWND g_hwnd = nullptr;
+static std::unique_ptr<cc::client::ClientSession> g_session;
 
 // Window procedure
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -173,9 +176,22 @@ int main(int argc, char* argv[]) {
             args.vsync ? "on" : "off",
             args.fullscreen ? "yes" : "no");
 
-    // TODO: Create and run ClientSession
-    CC_INFO("Client initialization complete — awaiting full pipeline implementation");
-    CC_INFO("Press ESC to close");
+    // Create and initialize client session
+    g_session = std::make_unique<cc::client::ClientSession>();
+    cc::client::ClientSession::Config sessionConfig;
+    sessionConfig.hostAddr      = args.hostAddr;
+    sessionConfig.videoPort     = args.port;
+    sessionConfig.windowWidth   = args.width;
+    sessionConfig.windowHeight  = args.height;
+    sessionConfig.vsync         = args.vsync;
+    sessionConfig.hwnd          = g_hwnd;
+
+    if (!g_session->Init(sessionConfig)) {
+        CC_ERROR("Client session init failed — window will remain but no streaming");
+        CC_INFO("Check that the host is running and reachable at %s", args.hostAddr.c_str());
+    }
+
+    CC_INFO("Connected to %s — press ESC to close", args.hostAddr.c_str());
 
     // Message loop
     MSG msg = {};
@@ -190,12 +206,16 @@ int main(int argc, char* argv[]) {
         }
 
         if (g_running) {
-            // TODO: Would be replaced by render loop driving
+            // Yield CPU — the render thread drives display in the background
             Sleep(1);
         }
     }
 
     CC_INFO("Shutting down...");
+    if (g_session) {
+        g_session->Stop();
+        g_session.reset();
+    }
     DestroyWindow(g_hwnd);
     cc::transport::CleanupWinsock();
 

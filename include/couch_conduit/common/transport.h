@@ -177,6 +177,16 @@ private:
 
     void RecvLoop();
     void TryAssembleFrame();
+
+    // FEC recovery support
+    struct FecGroup {
+        std::vector<uint8_t> parityData;
+        uint8_t groupStart = 0;
+        uint8_t groupId = 0;
+        bool valid = false;
+    };
+    template<typename T>
+    void TryFecRecovery(T& fecGroups);
 };
 
 // ─── Input Sender (Client side) ────────────────────────────────────────

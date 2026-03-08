@@ -27,6 +27,10 @@ cmake-build-*/
 # Dependencies (managed by vcpkg/FetchContent)
 vcpkg_installed/
 
+# Third-party cloned dependencies (re-clone via README instructions)
+third_party/nv-codec-headers/
+third_party/ffmpeg/
+
 # OS
 Thumbs.db
 desktop.ini

@@ -13,8 +13,10 @@ target_include_directories(cc_client PRIVATE
 )
 
 # FFmpeg (for D3D11VA decode)
-# User must have FFmpeg dev libraries available
-# Typical: vcpkg install ffmpeg[avcodec,avutil,swscale]:x64-windows
+# Check multiple locations:
+# 1. Bundled in third_party/ffmpeg
+# 2. FFMPEG_DIR environment variable
+# 3. vcpkg
 find_path(FFMPEG_INCLUDE_DIR libavcodec/avcodec.h
     HINTS
         "${CMAKE_SOURCE_DIR}/third_party/ffmpeg/include"
@@ -35,9 +37,10 @@ if(FFMPEG_INCLUDE_DIR AND AVCODEC_LIB AND AVUTIL_LIB)
     message(STATUS "Found FFmpeg: ${FFMPEG_INCLUDE_DIR}")
     target_include_directories(cc_client PRIVATE ${FFMPEG_INCLUDE_DIR})
     target_link_libraries(cc_client PRIVATE ${AVCODEC_LIB} ${AVUTIL_LIB})
+    target_compile_definitions(cc_client PRIVATE HAS_FFMPEG=1)
 else()
-    message(WARNING "FFmpeg not found. Set FFMPEG_DIR or install via vcpkg. "
-                    "Client will not build until FFmpeg is available.")
+    message(WARNING "FFmpeg not found. Decoder/Renderer will compile as stubs. "
+                    "Set FFMPEG_DIR or install via: vcpkg install ffmpeg[avcodec,avutil]:x64-windows")
 endif()
 
 target_link_libraries(cc_client PRIVATE

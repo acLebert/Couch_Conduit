@@ -8,17 +8,14 @@
 #include <couch_conduit/common/types.h>
 #include <couch_conduit/common/transport.h>
 #include <couch_conduit/common/log.h>
+#include <couch_conduit/host/host_session.h>
 
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <csignal>
 #include <atomic>
-
-// Forward declaration — defined in host_session.cpp
-namespace cc::host {
-    class HostSession;
-}
+#include <memory>
 
 static std::atomic<bool> g_running{true};
 
@@ -92,17 +89,35 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // TODO: Create and run HostSession
-    // For now, demonstrate the architecture by logging initialization
-    CC_INFO("Winsock initialized");
-    CC_INFO("Host initialization complete — awaiting full pipeline implementation");
-    CC_INFO("Press Ctrl+C to stop");
+    // Create and initialize host session
+    auto session = std::make_unique<cc::host::HostSession>();
+    cc::host::HostSession::Config sessionConfig;
+    sessionConfig.clientHost        = args.clientHost;
+    sessionConfig.video.fps         = args.fps;
+    sessionConfig.video.bitrateKbps = args.bitrateKbps;
+    sessionConfig.video.codec       = args.codec;
 
-    while (g_running) {
+    if (!session->Init(sessionConfig)) {
+        CC_FATAL("Host session initialization failed");
+        cc::transport::CleanupWinsock();
+        return 1;
+    }
+
+    if (!session->Start()) {
+        CC_FATAL("Host session failed to start");
+        cc::transport::CleanupWinsock();
+        return 1;
+    }
+
+    CC_INFO("Streaming to %s — press Ctrl+C to stop", args.clientHost.c_str());
+
+    while (g_running && session->IsStreaming()) {
         Sleep(100);
     }
 
     CC_INFO("Shutting down...");
+    session->Stop();
+    session.reset();
     cc::transport::CleanupWinsock();
 
     return 0;

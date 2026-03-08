@@ -39,8 +39,15 @@ bool VideoReceiver::Start(uint16_t port, FrameCallback callback) {
 
 void VideoReceiver::RecvLoop() {
     std::vector<uint8_t> buf(kMaxPacketSize + 64);
-    // TODO: Store FEC packets for recovery
-    // std::vector<std::vector<uint8_t>> fecPackets;
+
+    // FEC recovery state per frame
+    struct FecGroup {
+        std::vector<uint8_t> parityData;
+        uint8_t groupStart = 0;
+        uint8_t groupId = 0;
+        bool valid = false;
+    };
+    std::vector<FecGroup> fecGroups;  // Indexed by fecGroupId
 
     while (m_running) {
         int received = m_socket.Recv(buf.data(), buf.size());
@@ -60,25 +67,41 @@ void VideoReceiver::RecvLoop() {
         VideoPacketHeader hdr;
         std::memcpy(&hdr, buf.data(), sizeof(hdr));
 
-        // Skip FEC packets for now (TODO: use for recovery)
-        if (hdr.payloadType == 97) {
-            continue;
-        }
-
         const uint8_t* payload = buf.data() + sizeof(VideoPacketHeader);
         size_t payloadLen = static_cast<size_t>(received) - sizeof(VideoPacketHeader);
+
+        // Store FEC packets for potential recovery
+        if (hdr.payloadType == 97) {
+            // This is a FEC parity packet — store for recovery
+            size_t groupIdx = hdr.fecGroupId % 16;  // circular buffer
+            if (groupIdx >= fecGroups.size()) fecGroups.resize(groupIdx + 1);
+            auto& fg = fecGroups[groupIdx];
+            fg.parityData.assign(payload, payload + payloadLen);
+            fg.groupStart = hdr.flags;  // Group start index stored in flags
+            fg.groupId = hdr.fecGroupId;
+            fg.valid = true;
+            continue;
+        }
 
         std::lock_guard<std::mutex> lock(m_frameMutex);
 
         // New frame?
         if (hdr.frameNumber != m_currentFrame.frameNumber || !m_currentFrame.totalPackets) {
-            // If we had a partial previous frame, deliver what we have
+            // If we had a partial previous frame, try FEC recovery then deliver
             if (m_currentFrame.receivedCount > 0 &&
                 m_currentFrame.receivedCount < m_currentFrame.totalPackets) {
-                CC_WARN("Frame %u incomplete: %u/%u packets",
-                        m_currentFrame.frameNumber,
-                        m_currentFrame.receivedCount,
-                        m_currentFrame.totalPackets);
+
+                // Attempt XOR FEC recovery if exactly one packet is missing in a group
+                TryFecRecovery(fecGroups);
+
+                if (m_currentFrame.receivedCount == m_currentFrame.totalPackets) {
+                    TryAssembleFrame();
+                } else {
+                    CC_WARN("Frame %u incomplete: %u/%u packets",
+                            m_currentFrame.frameNumber,
+                            m_currentFrame.receivedCount,
+                            m_currentFrame.totalPackets);
+                }
             }
 
             // Start tracking new frame
@@ -104,6 +127,55 @@ void VideoReceiver::RecvLoop() {
         if (m_currentFrame.receivedCount == m_currentFrame.totalPackets) {
             TryAssembleFrame();
         }
+    }
+}
+
+template<typename T>
+void VideoReceiver::TryFecRecovery(T& fecGroups) {
+    // XOR-based FEC: if exactly one packet is missing from a FEC group,
+    // we can recover it by XOR-ing the parity with all received packets.
+    // This handles single-packet loss within a group cheaply.
+
+    for (auto& fg : fecGroups) {
+        if (!fg.valid) continue;
+
+        uint8_t groupStart = fg.groupStart;
+        // Determine group end: next group start or end of frame
+        uint8_t groupEnd = m_currentFrame.totalPackets;
+
+        // Count missing in this group
+        int missingIdx = -1;
+        int missingCount = 0;
+        for (uint8_t i = groupStart; i < groupEnd && i < m_currentFrame.totalPackets; ++i) {
+            if (!m_currentFrame.received[i]) {
+                missingIdx = i;
+                missingCount++;
+            }
+        }
+
+        // XOR can only recover exactly 1 missing packet
+        if (missingCount != 1 || missingIdx < 0) continue;
+
+        // Recover: XOR parity with all received packets in the group
+        std::vector<uint8_t> recovered = fg.parityData;
+
+        for (uint8_t i = groupStart; i < groupEnd && i < m_currentFrame.totalPackets; ++i) {
+            if (i == static_cast<uint8_t>(missingIdx)) continue;
+            if (!m_currentFrame.received[i]) continue;
+
+            auto& pkt = m_currentFrame.packets[i];
+            for (size_t j = 0; j < std::min(recovered.size(), pkt.size()); ++j) {
+                recovered[j] ^= pkt[j];
+            }
+        }
+
+        // Store recovered packet
+        m_currentFrame.packets[missingIdx] = std::move(recovered);
+        m_currentFrame.received[missingIdx] = true;
+        m_currentFrame.receivedCount++;
+
+        CC_DEBUG("FEC recovered packet %d of frame %u", missingIdx, m_currentFrame.frameNumber);
+        fg.valid = false;  // Used
     }
 }
 

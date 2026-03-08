@@ -15,6 +15,16 @@
 
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
+#include <dwmapi.h>
+
+#ifdef HAS_FFMPEG
+extern "C" {
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_d3d11va.h>
+#include <libavutil/frame.h>
+#include <libavutil/pixfmt.h>
+}
+#endif
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -356,10 +366,6 @@ void Renderer::RenderLoop() {
 }
 
 void Renderer::RenderFrame(AVFrame* frame) {
-    // TODO: Extract D3D11 texture from AVFrame->data[0] (hw_frames_ctx)
-    // Create SRVs for Y and UV planes
-    // Set pipeline state and draw fullscreen triangle
-
     // Set render target
     m_context->OMSetRenderTargets(1, m_rtv.GetAddressOf(), nullptr);
 
@@ -375,13 +381,69 @@ void Renderer::RenderFrame(AVFrame* frame) {
     m_context->PSSetShader(m_pixelShader.Get(), nullptr, 0);
     m_context->PSSetSamplers(0, 1, m_sampler.GetAddressOf());
 
-    // TODO: Bind Y and UV SRVs from the decoded texture
-    // m_context->PSSetShaderResources(0, 1, &srvY);
-    // m_context->PSSetShaderResources(1, 1, &srvUV);
+#ifdef HAS_FFMPEG
+    // Extract D3D11 texture from AVFrame (hw_frames_ctx / D3D11VA)
+    // frame->data[0] is the ID3D11Texture2D*
+    // frame->data[1] is the array index (subresource) as intptr_t
+    if (frame && frame->format == AV_PIX_FMT_D3D11) {
+        auto* texture = reinterpret_cast<ID3D11Texture2D*>(frame->data[0]);
+        auto  subIndex = static_cast<UINT>(reinterpret_cast<intptr_t>(frame->data[1]));
+
+        if (texture) {
+            D3D11_TEXTURE2D_DESC desc;
+            texture->GetDesc(&desc);
+
+            // Create Y plane SRV (R8_UNORM view of the NV12 luma)
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDescY = {};
+            srvDescY.Format = DXGI_FORMAT_R8_UNORM;
+            srvDescY.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+            srvDescY.Texture2DArray.MostDetailedMip = 0;
+            srvDescY.Texture2DArray.MipLevels = 1;
+            srvDescY.Texture2DArray.FirstArraySlice = subIndex;
+            srvDescY.Texture2DArray.ArraySize = 1;
+
+            ComPtr<ID3D11ShaderResourceView> srvY;
+            HRESULT hr = m_device->CreateShaderResourceView(texture, &srvDescY, &srvY);
+            if (FAILED(hr)) {
+                CC_ERROR("Failed to create Y plane SRV: 0x%08X", hr);
+                return;
+            }
+
+            // Create UV plane SRV (R8G8_UNORM view of the NV12 chroma)
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDescUV = {};
+            srvDescUV.Format = DXGI_FORMAT_R8G8_UNORM;
+            srvDescUV.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+            srvDescUV.Texture2DArray.MostDetailedMip = 0;
+            srvDescUV.Texture2DArray.MipLevels = 1;
+            srvDescUV.Texture2DArray.FirstArraySlice = subIndex;
+            srvDescUV.Texture2DArray.ArraySize = 1;
+
+            ComPtr<ID3D11ShaderResourceView> srvUV;
+            hr = m_device->CreateShaderResourceView(texture, &srvDescUV, &srvUV);
+            if (FAILED(hr)) {
+                CC_ERROR("Failed to create UV plane SRV: 0x%08X", hr);
+                return;
+            }
+
+            // Bind SRVs to pixel shader
+            ID3D11ShaderResourceView* srvs[] = { srvY.Get(), srvUV.Get() };
+            m_context->PSSetShaderResources(0, 2, srvs);
+        }
+    }
+#else
+    (void)frame;
+    // Without FFmpeg, clear to a dark blue so the window isn't garbage
+    const float clearColor[] = { 0.0f, 0.0f, 0.15f, 1.0f };
+    m_context->ClearRenderTargetView(m_rtv.Get(), clearColor);
+#endif
 
     // Draw fullscreen triangle (3 vertices, no vertex buffer)
     m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_context->Draw(3, 0);
+
+    // Unbind SRVs to prevent state leaking
+    ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr };
+    m_context->PSSetShaderResources(0, 2, nullSrvs);
 }
 
 void Renderer::Present() {

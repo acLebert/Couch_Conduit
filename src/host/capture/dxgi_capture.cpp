@@ -214,13 +214,24 @@ void DxgiCapture::CaptureLoop() {
     // Calculate fallback interval for when no input arrives
     const DWORD fallbackIntervalMs = (m_config.maxFps > 0) ? (1000 / m_config.maxFps) : 16;
 
+    // Minimum interval between captures to avoid overwhelming encoder
+    const int64_t minIntervalUs = (m_config.maxFps > 0) ? (1000000 / m_config.maxFps) : 16000;
+    int64_t lastCaptureUs = 0;
+
     while (m_running) {
         // Wait for either:
         // 1. Input trigger (immediate capture)
         // 2. Timeout (fallback to periodic capture)
         DWORD waitResult = WaitForSingleObject(m_triggerEvent, fallbackIntervalMs);
+        (void)waitResult;
 
         if (!m_running) break;
+
+        // Enforce minimum capture interval to prevent encoder overload
+        int64_t nowUs = cc::NowUsec();
+        if (lastCaptureUs > 0 && (nowUs - lastCaptureUs) < minIntervalUs) {
+            continue;
+        }
 
         // Acquire desktop frame
         ID3D11Texture2D* texture = nullptr;
@@ -228,17 +239,18 @@ void DxgiCapture::CaptureLoop() {
 
         if (AcquireFrame(&texture, &captureTimestamp)) {
             m_frameNumber++;
+            lastCaptureUs = captureTimestamp;
 
             // Deliver to encoder (stays in VRAM)
             if (m_callback) {
                 m_callback(texture, m_frameNumber, captureTimestamp);
             }
 
+            // Release the acquired texture AFTER the callback returns
+            // (encoder must copy/register the texture synchronously)
+            if (texture) texture->Release();
             ReleaseFrame();
         }
-
-        // Suppress unused variable warning
-        (void)waitResult;
     }
 }
 
@@ -251,6 +263,7 @@ bool DxgiCapture::AcquireFrame(ID3D11Texture2D** outTexture, int64_t* outTimesta
     ComPtr<IDXGIResource> resource;
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
 
+    // Timeout=0: non-blocking. We already waited on triggerEvent/timer.
     HRESULT hr = m_duplication->AcquireNextFrame(0, &frameInfo, &resource);
 
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
@@ -270,16 +283,28 @@ bool DxgiCapture::AcquireFrame(ID3D11Texture2D** outTexture, int64_t* outTimesta
         return false;
     }
 
+    // Check if this frame has actual desktop image updates.
+    // AccumulatedFrames > 0 means the desktop image was updated.
+    // TotalMetadataBufferSize > 0 means there are dirty/move rects.
+    // LastPresentTime == 0 means no new image (only pointer updates).
+    if (frameInfo.LastPresentTime.QuadPart == 0 && frameInfo.AccumulatedFrames == 0) {
+        // Only pointer update, no desktop image change.
+        // We still provide the frame — encoder can skip if identical.
+        // But capture timestamp is still valid.
+    }
+
     *outTimestamp = cc::NowUsec();
 
     // Get the texture from the DXGI resource
-    hr = resource.As(outTexture);
+    ComPtr<ID3D11Texture2D> tex;
+    hr = resource.As(&tex);
     if (FAILED(hr)) {
         CC_ERROR("Failed to get texture from DXGI resource: 0x%08X", hr);
         m_duplication->ReleaseFrame();
         return false;
     }
 
+    *outTexture = tex.Detach();  // Transfer ownership to caller
     return true;
 }
 
