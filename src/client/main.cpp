@@ -120,6 +120,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_INPUT: {
             // Raw Input for mouse — gives sub-pixel relative motion
+            // Only forward when our window is the foreground window to prevent
+            // feedback loops (especially on localhost where host SendInput
+            // generates new Raw Input events).
+            if (GetForegroundWindow() != hwnd) {
+                return DefWindowProcW(hwnd, msg, wParam, lParam);
+            }
             UINT dataSize = 0;
             GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam),
                             RID_INPUT, nullptr, &dataSize, sizeof(RAWINPUTHEADER));
@@ -183,10 +189,13 @@ HWND CreateGameWindow(uint32_t width, uint32_t height, bool fullscreen) {
         UpdateWindow(hwnd);
 
         // Register for raw input (mouse)
+        // NOTE: Do NOT use RIDEV_INPUTSINK — it captures mouse input even when
+        // the window isn't focused, causing a feedback loop on localhost where
+        // SendInput() on the host generates new Raw Input events → amplified DPI.
         RAWINPUTDEVICE rid = {};
         rid.usUsagePage = 0x01;  // Generic Desktop
         rid.usUsage = 0x02;      // Mouse
-        rid.dwFlags = RIDEV_INPUTSINK;
+        rid.dwFlags = 0;         // Only receive input when focused
         rid.hwndTarget = hwnd;
         RegisterRawInputDevices(&rid, 1, sizeof(rid));
     }
