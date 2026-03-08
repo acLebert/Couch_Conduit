@@ -125,10 +125,13 @@ bool ClientSession::Init(const Config& config) {
 void ClientSession::Stop() {
     m_feedbackRunning = false;
     m_hapticRunning = false;
-    if (m_feedbackThread.joinable()) m_feedbackThread.join();
-    if (m_hapticThread.joinable()) m_hapticThread.join();
+
+    // Close sockets FIRST to unblock any threads stuck in Recv()/Send()
     m_feedbackSocket.Close();
     m_hapticSocket.Close();
+
+    if (m_feedbackThread.joinable()) m_feedbackThread.join();
+    if (m_hapticThread.joinable()) m_hapticThread.join();
     if (m_inputCapture)   m_inputCapture->Stop();
     if (m_audioReceiver)  m_audioReceiver->Stop();
     if (m_renderer)       m_renderer->Stop();
