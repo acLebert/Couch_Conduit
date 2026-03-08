@@ -24,19 +24,19 @@ namespace cc::client {
 
 // ─── Color constants (linear float RGBA) ────────────────────────────────
 namespace colors {
-    static constexpr ImVec4 kBgDark       = {0.051f, 0.051f, 0.051f, 0.92f};  // #0D0D0D
-    static constexpr ImVec4 kBgPanel      = {0.102f, 0.102f, 0.102f, 0.95f};  // #1A1A1A
-    static constexpr ImVec4 kBgPopup      = {0.110f, 0.098f, 0.078f, 0.97f};  // warm-tinted
-    static constexpr ImVec4 kAmber        = {0.910f, 0.659f, 0.298f, 1.00f};  // #E8A84C
-    static constexpr ImVec4 kAmberDim     = {0.769f, 0.490f, 0.165f, 1.00f};  // #C47D2A
-    static constexpr ImVec4 kAmberDark    = {0.553f, 0.365f, 0.122f, 1.00f};  // #8D5D1F
-    static constexpr ImVec4 kTeal         = {0.306f, 0.788f, 0.690f, 1.00f};  // #4EC9B0
-    static constexpr ImVec4 kTealDim      = {0.220f, 0.580f, 0.510f, 1.00f};
-    static constexpr ImVec4 kDimText      = {0.478f, 0.478f, 0.431f, 1.00f};  // #7A7A6E
-    static constexpr ImVec4 kWhite        = {0.920f, 0.900f, 0.860f, 1.00f};  // warm white
-    static constexpr ImVec4 kRed          = {0.831f, 0.416f, 0.416f, 1.00f};  // #D46A6A
-    static constexpr ImVec4 kYellow       = {0.831f, 0.655f, 0.416f, 1.00f};  // #D4A76A
-    static constexpr ImVec4 kGreen        = {0.416f, 0.831f, 0.490f, 1.00f};
+    static constexpr ImVec4 kBgDark       = {0.039f, 0.039f, 0.039f, 0.96f};  // #0A0A0A, nearly opaque
+    static constexpr ImVec4 kBgPanel      = {0.082f, 0.082f, 0.082f, 0.97f};  // #151515
+    static constexpr ImVec4 kBgPopup      = {0.090f, 0.078f, 0.059f, 0.98f};  // warm-tinted
+    static constexpr ImVec4 kAmber        = {1.000f, 0.730f, 0.200f, 1.00f};  // #FFB933 — vivid amber
+    static constexpr ImVec4 kAmberDim     = {0.900f, 0.560f, 0.120f, 1.00f};  // #E58F1F
+    static constexpr ImVec4 kAmberDark    = {0.620f, 0.400f, 0.100f, 1.00f};  // #9E661A
+    static constexpr ImVec4 kTeal         = {0.200f, 0.920f, 0.780f, 1.00f};  // #33EBC7 — vivid teal
+    static constexpr ImVec4 kTealDim      = {0.150f, 0.700f, 0.580f, 1.00f};
+    static constexpr ImVec4 kDimText      = {0.580f, 0.580f, 0.520f, 1.00f};  // #949485 — brighter gray
+    static constexpr ImVec4 kWhite        = {0.960f, 0.940f, 0.900f, 1.00f};  // warm white
+    static constexpr ImVec4 kRed          = {1.000f, 0.400f, 0.400f, 1.00f};  // #FF6666 — vivid red
+    static constexpr ImVec4 kYellow       = {1.000f, 0.780f, 0.280f, 1.00f};  // #FFC747 — vivid yellow
+    static constexpr ImVec4 kGreen        = {0.300f, 1.000f, 0.500f, 1.00f};  // #4DFF80 — vivid green
     static constexpr ImVec4 kTransparent  = {0.0f, 0.0f, 0.0f, 0.0f};
 }
 
@@ -144,7 +144,7 @@ void Overlay::Draw() {
     // ─── Compact Stats HUD (top-left) ──────────────────────────────────
     if (m_showStats) {
         ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_Always);
-        ImGui::SetNextWindowBgAlpha(0.78f);
+        ImGui::SetNextWindowBgAlpha(0.92f);
 
         ImGuiWindowFlags statsFlags =
             ImGuiWindowFlags_NoDecoration |
