@@ -285,7 +285,20 @@ void Overlay::Draw() {
             }
 
             ImGui::Separator();
-            TextColored(colors::kDimText, "F3 toggle stats  |  F1 this panel  |  ESC quit");
+
+            // Disconnect button
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.70f, 0.18f, 0.18f, 0.90f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.25f, 0.25f, 1.00f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.55f, 0.12f, 0.12f, 1.00f));
+            if (ImGui::Button("DISCONNECT", ImVec2(-1, 36))) {
+                m_disconnectRequested = true;
+            }
+            ImGui::PopStyleColor(3);
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            TextColored(colors::kDimText, "F3 stats | F1 panel | F4 disconnect | ESC quit");
         }
         ImGui::End();
 
@@ -305,7 +318,7 @@ void Overlay::Draw() {
 
         ImGui::PushStyleColor(ImGuiCol_WindowBg, colors::kBgDark);
         if (ImGui::Begin("##hint", nullptr, hintFlags)) {
-            TextColored(colors::kDimText, "F3 stats | F1 panel");
+            TextColored(colors::kDimText, "F3 stats | F1 panel | F4 disconnect");
         }
         ImGui::End();
         ImGui::PopStyleColor();

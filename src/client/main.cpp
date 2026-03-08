@@ -24,6 +24,7 @@
 #include <memory>
 
 static std::atomic<bool> g_running{true};
+static std::atomic<bool> g_disconnectRequested{false};
 static HWND g_hwnd = nullptr;
 static std::unique_ptr<cc::client::ClientSession> g_session;
 static bool g_inSizeMove = false;  // True while user is dragging/resizing the window
@@ -61,6 +62,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (overlay && !(lParam & (1 << 30))) {
                     if (wParam == VK_F1) { overlay->TogglePanel(); return 0; }
                     if (wParam == VK_F3) { overlay->ToggleStats(); return 0; }
+                    if (wParam == VK_F4) { overlay->RequestDisconnect(); return 0; }
                 }
             }
             // Forward all other keys to host
@@ -313,18 +315,108 @@ int main(int argc, char* argv[]) {
     if (showConnectionScreen) {
         CC_INFO("No host specified — showing connection screen");
 
-        auto connResult = cc::client::ShowConnectionScreen(
-            g_hwnd, args.width, args.height, args.signalingServer);
+        // ===============================================================
+        // Main connection loop: show UI → connect → stream → disconnect
+        // → back to connection UI.  Exits when user closes the window.
+        // ===============================================================
+        while (g_running) {
+            auto connResult = cc::client::ShowConnectionScreen(
+                g_hwnd, args.width, args.height, args.signalingServer);
 
-        if (!connResult.connected || connResult.cancelled) {
-            CC_INFO("Connection cancelled by user");
-            DestroyWindow(g_hwnd);
-            cc::transport::CleanupWinsock();
-            return 0;
+            if (!connResult.connected || connResult.cancelled) {
+                CC_INFO("Connection cancelled by user");
+                break;
+            }
+
+            args.hostAddr = connResult.hostAddr;
+            CC_INFO("Connecting to %s:%u", args.hostAddr.c_str(), connResult.controlPort);
+
+            // ── Session negotiation ──────────────────────────────────
+            std::array<uint8_t, 16> sessionKey{};
+            bool encrypted = false;
+            uint32_t negotiatedWidth = args.width;
+            uint32_t negotiatedHeight = args.height;
+
+            {
+                CC_INFO("Connecting to host via TCP session (ECDH key exchange)...");
+                cc::protocol::Session tcpSession;
+                cc::protocol::SessionConfig negotiated;
+                if (tcpSession.ConnectToHost(args.hostAddr, connResult.controlPort,
+                                              negotiated, 10000)) {
+                    sessionKey = negotiated.sessionKey;
+                    encrypted = true;
+                    negotiatedWidth = negotiated.width;
+                    negotiatedHeight = negotiated.height;
+                    CC_INFO("Session established — %ux%u, encryption ON",
+                            negotiatedWidth, negotiatedHeight);
+                } else {
+                    CC_WARN("TCP session failed — falling back to direct UDP");
+                }
+            }
+
+            // ── Create session & stream ─────────────────────────
+            g_session = std::make_unique<cc::client::ClientSession>();
+            cc::client::ClientSession::Config cfg;
+            cfg.hostAddr      = args.hostAddr;
+            cfg.videoPort     = cc::kDefaultVideoPort;
+            cfg.windowWidth   = negotiatedWidth;
+            cfg.windowHeight  = negotiatedHeight;
+            cfg.vsync         = args.vsync;
+            cfg.hwnd          = g_hwnd;
+            cfg.sessionKey    = sessionKey;
+            cfg.encrypted     = encrypted;
+
+            if (!g_session->Init(cfg)) {
+                CC_ERROR("Session init failed for %s", args.hostAddr.c_str());
+                g_session.reset();
+                continue;  // back to connection screen
+            }
+
+            CC_INFO("Connected to %s — F4 to disconnect, ESC to quit", args.hostAddr.c_str());
+
+            // Message loop — runs until user quits or disconnects
+            g_disconnectRequested = false;
+            MSG msg = {};
+            while (g_running && !g_disconnectRequested) {
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    if (msg.message == WM_QUIT) {
+                        g_running = false;
+                        break;
+                    }
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+
+                // Check overlay disconnect button
+                if (g_session) {
+                    auto* overlay = g_session->GetOverlay();
+                    if (overlay && overlay->IsDisconnectRequested()) {
+                        g_disconnectRequested = true;
+                    }
+                }
+
+                if (g_running && !g_disconnectRequested) {
+                    Sleep(1);
+                }
+            }
+
+            // Tear down session
+            CC_INFO("Disconnecting...");
+            if (g_session) {
+                g_session->Stop();
+                g_session.reset();
+            }
+
+            if (!g_running) break;  // window closed — exit completely
+
+            CC_INFO("Returning to connection screen");
+            // Loop back to ShowConnectionScreen
         }
 
-        args.hostAddr = connResult.hostAddr;
-        CC_INFO("Connecting to %s:%u", args.hostAddr.c_str(), connResult.controlPort);
+        // Clean exit
+        DestroyWindow(g_hwnd);
+        cc::transport::CleanupWinsock();
+        return 0;
     }
 
     CC_INFO("Connecting to host: %s", args.hostAddr.c_str());
