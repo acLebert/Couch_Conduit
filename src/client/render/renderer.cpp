@@ -45,10 +45,10 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float  y  = texY.Sample(samp, input.uv);
     float2 uv = texUV.Sample(samp, input.uv);
 
-    // BT.709 YUV → RGB conversion
-    float r = y + 1.5748 * (uv.x - 0.5);
-    float g = y - 0.1873 * (uv.y - 0.5) - 0.4681 * (uv.x - 0.5);
-    float b = y + 1.8556 * (uv.y - 0.5);
+    // BT.709 YCbCr → RGB  (uv.x = U/Cb, uv.y = V/Cr)
+    float r = y + 1.5748 * (uv.y - 0.5);
+    float g = y - 0.1873 * (uv.x - 0.5) - 0.4681 * (uv.y - 0.5);
+    float b = y + 1.8556 * (uv.x - 0.5);
 
     return float4(saturate(r), saturate(g), saturate(b), 1.0);
 }
