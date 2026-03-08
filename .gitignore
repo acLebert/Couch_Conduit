@@ -1,0 +1,33 @@
+# Build
+build/
+out/
+cmake-build-*/
+.vs/
+*.vcxproj*
+*.sln
+
+# IDE
+.vscode/settings.json
+.idea/
+*.suo
+*.user
+*.ncb
+*.opendb
+*.db
+
+# Binaries
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.obj
+*.o
+
+# Dependencies (managed by vcpkg/FetchContent)
+vcpkg_installed/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
