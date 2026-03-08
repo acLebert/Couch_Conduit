@@ -6,6 +6,9 @@ cmake-build-*/
 *.vcxproj*
 *.sln
 
+# Distribution
+dist/
+
 # IDE
 .vscode/settings.json
 .idea/
