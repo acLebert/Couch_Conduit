@@ -16,6 +16,8 @@
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <dwmapi.h>
+#include <ctime>
+#include <cstdio>
 
 #ifdef HAS_FFMPEG
 extern "C" {
@@ -85,6 +87,7 @@ Renderer::~Renderer() {
 
 bool Renderer::Init(const Config& config) {
     m_config = config;
+    m_processStartUs = config.processStartUs;
 
     InitializeCriticalSectionAndSpinCount(&m_pendingLock, 4000);
     m_frameSubmittedEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -99,6 +102,21 @@ bool Renderer::Init(const Config& config) {
     // Initialize ImGui overlay
     if (!m_overlay.Init(config.hwnd, m_device.Get(), m_context.Get())) {
         CC_WARN("ImGui overlay init failed — continuing without overlay");
+    }
+
+    // ── Benchmark CSV ────────────────────────────────────────────────
+    if (!config.csvPath.empty()) {
+        m_csvFile = fopen(config.csvPath.c_str(), "w");
+        if (m_csvFile) {
+            fprintf(m_csvFile,
+                "timestamp_iso,interval_s,fps,avg_decode_ms,avg_render_ms,"
+                "avg_pipeline_ms,min_pipeline_ms,max_pipeline_ms,"
+                "dropped_frames,first_decode_ms,first_present_ms\n");
+            fflush(m_csvFile);
+            CC_INFO("Benchmark CSV opened: %s", config.csvPath.c_str());
+        } else {
+            CC_WARN("Failed to open benchmark CSV: %s", config.csvPath.c_str());
+        }
     }
 
     CC_INFO("Renderer initialized: %ux%u, vsync=%s, tearing=%s",
@@ -294,6 +312,7 @@ void Renderer::SubmitFrame(AVFrame* frame, const FrameMetadata& meta) {
     // If there was an old pending frame we never rendered, free it
     // (deferred to prevent GPU stalls)
     if (m_pending.ready && m_pending.frame) {
+        m_droppedFrames.fetch_add(1, std::memory_order_relaxed);
         // Swap with deferred free slot
         if (m_deferredFreeFrame) {
 #ifdef HAS_FFMPEG
@@ -334,6 +353,7 @@ void Renderer::RenderLoop() {
     int64_t minPipelineUs = INT64_MAX;
     int64_t maxPipelineUs = 0;
     int64_t totalPipelineUs = 0;
+    uint32_t droppedSnapshotLast = 0;  // For per-interval dropped count
 
     while (m_running) {
         // Wait for a frame to be submitted
@@ -356,6 +376,11 @@ void Renderer::RenderLoop() {
 
         if (!frame && meta.frameNumber == 0) continue;  // Spurious wake
 
+        // ── Startup timing: first decoded frame ─────────────────────
+        if (m_firstDecodeUs == 0 && meta.decodeEndUs > 0) {
+            m_firstDecodeUs = meta.decodeEndUs;
+        }
+
         // Begin GPU timestamp
         if (m_tsDisjoint) {
             m_context->Begin(m_tsDisjoint.Get());
@@ -374,6 +399,11 @@ void Renderer::RenderLoop() {
 
         // Present with zero latency
         Present();
+
+        // ── Startup timing: first present ───────────────────────────
+        if (m_firstPresentUs == 0) {
+            m_firstPresentUs = cc::NowUsec();
+        }
 
         // End GPU timestamp
         if (m_tsDisjoint) {
@@ -413,7 +443,7 @@ void Renderer::RenderLoop() {
             float maxPipelineMs = static_cast<float>(maxPipelineUs) / 1000.0f;
             float fps = static_cast<float>(frameCount) / ((now - lastStatsTime) / 1000000.0f);
 
-            CC_INFO("Pipeline stats: %.1f fps | decode=%.2fms | render=%.2fms | recv→present=%.2fms (min=%.2f max=%.2f)",
+            CC_INFO("Pipeline stats: %.1f fps | decode=%.2fms | render=%.2fms | recv->present=%.2fms (min=%.2f max=%.2f)",
                     fps, avgDecodeMs, avgRenderMs, avgPipelineMs, minPipelineMs, maxPipelineMs);
 
             // Feed stats to ImGui overlay
@@ -426,6 +456,34 @@ void Renderer::RenderLoop() {
                 os.minPipelineMs   = minPipelineMs;
                 os.maxPipelineMs   = maxPipelineMs;
                 m_overlay.UpdateStats(os);
+            }
+
+            // ── Benchmark CSV row ───────────────────────────────────
+            if (m_csvFile) {
+                // ISO 8601 timestamp
+                time_t t = time(nullptr);
+                struct tm tmBuf;
+                localtime_s(&tmBuf, &t);
+                char tsBuf[32];
+                strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%dT%H:%M:%S", &tmBuf);
+
+                float intervalSec = (now - lastStatsTime) / 1000000.0f;
+                uint32_t droppedNow = m_droppedFrames.load(std::memory_order_relaxed);
+                uint32_t droppedInterval = droppedNow - droppedSnapshotLast;
+                droppedSnapshotLast = droppedNow;
+
+                float firstDecodeMs = (m_firstDecodeUs > 0 && m_processStartUs > 0)
+                    ? static_cast<float>(m_firstDecodeUs - m_processStartUs) / 1000.0f : -1.0f;
+                float firstPresentMs = (m_firstPresentUs > 0 && m_processStartUs > 0)
+                    ? static_cast<float>(m_firstPresentUs - m_processStartUs) / 1000.0f : -1.0f;
+
+                fprintf(m_csvFile,
+                    "%s,%.3f,%.1f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%.1f,%.1f\n",
+                    tsBuf, intervalSec, fps,
+                    avgDecodeMs, avgRenderMs, avgPipelineMs,
+                    minPipelineMs, maxPipelineMs,
+                    droppedInterval, firstDecodeMs, firstPresentMs);
+                fflush(m_csvFile);
             }
 
             // Reset
@@ -615,6 +673,13 @@ void Renderer::Stop() {
         m_renderThread.join();
     }
     m_overlay.Shutdown();
+
+    // Close benchmark CSV
+    if (m_csvFile) {
+        fclose(m_csvFile);
+        m_csvFile = nullptr;
+        CC_INFO("Benchmark CSV closed");
+    }
 
     // Release all D3D11 references so the swap chain is truly freed.
     // Without ClearState + Flush, the context keeps internal refs to

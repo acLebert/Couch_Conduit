@@ -230,6 +230,8 @@ struct CliArgs {
     bool        noSession = false;
     bool        hasHostArg = false;        // True if user specified a host on CLI
     std::string signalingServer;           // Room code signaling server URL
+    uint32_t    duration = 0;              // Benchmark: auto-exit after N seconds (0 = disabled)
+    std::string csvPath;                   // Benchmark: write periodic stats CSV to this path
 };
 
 CliArgs ParseArgs(int argc, char* argv[]) {
@@ -254,6 +256,10 @@ CliArgs ParseArgs(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--resolution") == 0 && i + 1 < argc) {
             ++i;
             sscanf(argv[i], "%ux%u", &args.width, &args.height);
+        } else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
+            args.duration = static_cast<uint32_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
+            args.csvPath = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Couch Conduit Client v%u.%u.%u\n\n",
                    cc::kVersionMajor, cc::kVersionMinor, cc::kVersionPatch);
@@ -265,6 +271,8 @@ CliArgs ParseArgs(int argc, char* argv[]) {
             printf("  --no-session           Skip TCP session (direct UDP)\n");
             printf("  --signaling-server <url> Signaling server for room codes\n");
             printf("  --resolution <WxH>     Window resolution (default: 1920x1080)\n");
+            printf("  --duration <seconds>   Auto-exit after N seconds (benchmark mode)\n");
+            printf("  --csv <path>           Write periodic benchmark stats to CSV file\n");
             printf("  --help                 Show this help\n");
             exit(0);
         }
@@ -274,6 +282,7 @@ CliArgs ParseArgs(int argc, char* argv[]) {
 }
 
 int main(int argc, char* argv[]) {
+    int64_t processStartUs = cc::NowUsec();
     auto args = ParseArgs(argc, argv);
 
     // Check environment variable for signaling server
@@ -489,6 +498,8 @@ int main(int argc, char* argv[]) {
     sessionConfig.hwnd          = g_hwnd;
     sessionConfig.sessionKey    = sessionKey;
     sessionConfig.encrypted     = encrypted;
+    sessionConfig.csvPath       = args.csvPath;
+    sessionConfig.processStartUs = processStartUs;
 
     if (!g_session->Init(sessionConfig)) {
         CC_ERROR("Client session init failed — window will remain but no streaming");
@@ -498,6 +509,7 @@ int main(int argc, char* argv[]) {
     CC_INFO("Connected to %s — press ESC to close", args.hostAddr.c_str());
 
     // Message loop
+    int64_t streamStartUs = cc::NowUsec();
     MSG msg = {};
     while (g_running) {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -510,6 +522,15 @@ int main(int argc, char* argv[]) {
         }
 
         if (g_running) {
+            // Benchmark auto-exit after --duration seconds
+            if (args.duration > 0) {
+                int64_t elapsed = cc::NowUsec() - streamStartUs;
+                if (elapsed > static_cast<int64_t>(args.duration) * 1000000LL) {
+                    CC_INFO("Benchmark duration %u seconds reached — exiting", args.duration);
+                    g_running = false;
+                    break;
+                }
+            }
             // Yield CPU — the render thread drives display in the background
             Sleep(1);
         }

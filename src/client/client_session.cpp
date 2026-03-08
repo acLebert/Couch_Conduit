@@ -16,10 +16,12 @@ bool ClientSession::Init(const Config& config) {
     // Initialize renderer (creates D3D11 device)
     m_renderer = std::make_unique<Renderer>();
     Renderer::Config renderConfig;
-    renderConfig.hwnd   = config.hwnd;
-    renderConfig.width  = config.windowWidth;
-    renderConfig.height = config.windowHeight;
-    renderConfig.vsync  = config.vsync;
+    renderConfig.hwnd           = config.hwnd;
+    renderConfig.width          = config.windowWidth;
+    renderConfig.height         = config.windowHeight;
+    renderConfig.vsync          = config.vsync;
+    renderConfig.csvPath        = config.csvPath;
+    renderConfig.processStartUs = config.processStartUs;
 
     if (!m_renderer->Init(renderConfig)) {
         CC_ERROR("Failed to init renderer");

@@ -9,6 +9,9 @@ cmake-build-*/
 # Distribution
 dist/
 
+# Benchmark output (raw CSV data)
+benchmarks/
+
 # IDE
 .vscode/settings.json
 .idea/

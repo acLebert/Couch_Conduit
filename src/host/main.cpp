@@ -35,6 +35,8 @@ struct CliArgs {
     cc::VideoCodec codec = cc::VideoCodec::HEVC;
     bool        noSession = false;  // Skip TCP session negotiation
     std::string signalingServer;    // Room code signaling server URL
+    uint32_t    duration = 0;       // Benchmark: auto-exit after N seconds (0 = disabled)
+    std::string csvPath;            // Benchmark: write periodic encode stats CSV
 };
 
 CliArgs ParseArgs(int argc, char* argv[]) {
@@ -62,6 +64,10 @@ CliArgs ParseArgs(int argc, char* argv[]) {
             args.noSession = true;
         } else if (strcmp(argv[i], "--signaling-server") == 0 && i + 1 < argc) {
             args.signalingServer = argv[++i];
+        } else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
+            args.duration = static_cast<uint32_t>(atoi(argv[++i]));
+        } else if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
+            args.csvPath = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Couch Conduit Host v%u.%u.%u\n\n",
                    cc::kVersionMajor, cc::kVersionMinor, cc::kVersionPatch);
@@ -74,6 +80,8 @@ CliArgs ParseArgs(int argc, char* argv[]) {
             printf("  --encode-resolution <WxH>  Encode resolution (default: capture res)\n");
             printf("  --no-session         Skip TCP session/key exchange (direct UDP)\n");
             printf("  --signaling-server <url>  Signaling server for room codes\n");
+            printf("  --duration <seconds> Auto-exit after N seconds (benchmark mode)\n");
+            printf("  --csv <path>         Write periodic encode stats to CSV file\n");
             printf("  --help               Show this help\n");
             exit(0);
         }
@@ -123,6 +131,7 @@ int main(int argc, char* argv[]) {
     sessionConfig.video.codec       = args.codec;
     sessionConfig.encodeWidth       = args.encodeWidth;
     sessionConfig.encodeHeight      = args.encodeHeight;
+    sessionConfig.csvPath           = args.csvPath;
 
     // ─── Room Code Registration ────────────────────────────────────
     std::string roomCode;
@@ -217,8 +226,18 @@ int main(int argc, char* argv[]) {
 
     CC_INFO("Streaming to %s — press Ctrl+C to stop", sessionConfig.clientHost.c_str());
 
+    int64_t streamStartUs = cc::NowUsec();
     while (g_running && session->IsStreaming()) {
         Sleep(100);
+
+        // Benchmark auto-exit after --duration seconds
+        if (args.duration > 0) {
+            int64_t elapsed = cc::NowUsec() - streamStartUs;
+            if (elapsed > static_cast<int64_t>(args.duration) * 1000000LL) {
+                CC_INFO("Benchmark duration %u seconds reached — exiting", args.duration);
+                break;
+            }
+        }
     }
 
     CC_INFO("Shutting down...");

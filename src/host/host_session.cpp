@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <ctime>
+#include <climits>
 
 namespace cc::host {
 
@@ -101,6 +103,22 @@ bool HostSession::Init(const Config& config) {
             m_encodeWidth, m_encodeHeight,
             config.video.fps, config.video.bitrateKbps,
             config.clientHost.c_str(), config.clientVideoPort);
+
+    // Open benchmark CSV if requested
+    if (!config.csvPath.empty()) {
+        m_csvFile = fopen(config.csvPath.c_str(), "w");
+        if (m_csvFile) {
+            fprintf(m_csvFile,
+                "timestamp_iso,interval_s,encoded_fps,avg_encode_ms,"
+                "min_encode_ms,max_encode_ms,bitrate_kbps\n");
+            fflush(m_csvFile);
+            m_lastStatsDumpUs = cc::NowUsec();
+            CC_INFO("Host benchmark CSV opened: %s", config.csvPath.c_str());
+        } else {
+            CC_WARN("Failed to open host benchmark CSV: %s", config.csvPath.c_str());
+        }
+    }
+
     return true;
 }
 
@@ -143,6 +161,14 @@ void HostSession::Stop() {
     if (m_capture)        m_capture->Stop();
     if (m_encoder)        m_encoder->Shutdown();
     if (m_inputInjector)  m_inputInjector->Shutdown();
+
+    // Close benchmark CSV
+    if (m_csvFile) {
+        fclose(m_csvFile);
+        m_csvFile = nullptr;
+        CC_INFO("Host benchmark CSV closed");
+    }
+
     CC_INFO("Host session stopped");
 }
 
@@ -269,6 +295,47 @@ void HostSession::OnEncodeDone(uint32_t frameNum, const uint8_t* data, size_t le
     for (auto& client : m_clients) {
         if (client->videoSender) {
             client->videoSender->SendFrame(frameNum, data, len, isIdr, hostProcTime);
+        }
+    }
+
+    // ── Benchmark encode stats accumulation ─────────────────────────
+    if (m_csvFile) {
+        int64_t encUs = encEnd - encStart;
+        m_totalEncodeUs += encUs;
+        m_encodeFrameCount++;
+        m_minEncodeUs = (std::min)(m_minEncodeUs, encUs);
+        m_maxEncodeUs = (std::max)(m_maxEncodeUs, encUs);
+
+        int64_t now = cc::NowUsec();
+        constexpr int64_t kStatsIntervalUs = 5000000;  // 5 seconds
+        if (now - m_lastStatsDumpUs > kStatsIntervalUs && m_encodeFrameCount > 0) {
+            float intervalSec = (now - m_lastStatsDumpUs) / 1000000.0f;
+            float fps = static_cast<float>(m_encodeFrameCount) / intervalSec;
+            float avgEncMs = static_cast<float>(m_totalEncodeUs) / m_encodeFrameCount / 1000.0f;
+            float minEncMs = static_cast<float>(m_minEncodeUs) / 1000.0f;
+            float maxEncMs = static_cast<float>(m_maxEncodeUs) / 1000.0f;
+
+            CC_INFO("Encode stats: %.1f fps | encode=%.2fms (min=%.2f max=%.2f) | %u kbps",
+                    fps, avgEncMs, minEncMs, maxEncMs, m_config.video.bitrateKbps);
+
+            // ISO 8601 timestamp
+            time_t t = time(nullptr);
+            struct tm tmBuf;
+            localtime_s(&tmBuf, &t);
+            char tsBuf[32];
+            strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%dT%H:%M:%S", &tmBuf);
+
+            fprintf(m_csvFile,
+                "%s,%.3f,%.1f,%.3f,%.3f,%.3f,%u\n",
+                tsBuf, intervalSec, fps, avgEncMs, minEncMs, maxEncMs,
+                m_config.video.bitrateKbps);
+            fflush(m_csvFile);
+
+            m_totalEncodeUs = 0;
+            m_encodeFrameCount = 0;
+            m_minEncodeUs = INT64_MAX;
+            m_maxEncodeUs = 0;
+            m_lastStatsDumpUs = now;
         }
     }
 }

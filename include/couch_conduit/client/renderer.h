@@ -14,6 +14,7 @@
 #include <thread>
 #include <mutex>
 #include <functional>
+#include <string>
 
 #include <couch_conduit/common/types.h>
 #include <couch_conduit/client/overlay.h>
@@ -50,6 +51,9 @@ public:
         uint32_t height         = 1080;
         bool     vsync          = false;  // Recommend OFF for lowest latency
         bool     fullscreen     = false;
+        // Benchmark mode — if csvPath is non-empty, write periodic stats CSV
+        std::string csvPath;
+        int64_t  processStartUs = 0;  // NowUsec() at process start (startup metrics)
     };
 
     /// Initialize the renderer and create the swap chain
@@ -127,6 +131,13 @@ private:
     // Stats
     std::atomic<float> m_lastRenderTimeMs{0};
     std::atomic<uint32_t> m_renderedFps{0};
+    std::atomic<uint32_t> m_droppedFrames{0};  // Frames overwritten before rendering
+
+    // Benchmark CSV
+    FILE*   m_csvFile        = nullptr;
+    int64_t m_processStartUs = 0;
+    int64_t m_firstDecodeUs  = 0;   // Set once on first decoded frame
+    int64_t m_firstPresentUs = 0;   // Set once on first Present()
 
     Overlay m_overlay;
 

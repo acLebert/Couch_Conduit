@@ -15,6 +15,7 @@
 #include <atomic>
 #include <string>
 #include <array>
+#include <cstdio>
 
 namespace cc::host {
 
@@ -33,6 +34,7 @@ public:
         uint32_t     encodeHeight     = 0;  // 0 = same as capture
         std::array<uint8_t, 16> sessionKey{};  // AES-128 key from ECDH
         bool         encrypted        = false;
+        std::string  csvPath;            // Benchmark: write periodic encode stats CSV
     };
 
     bool Init(const Config& config);
@@ -100,6 +102,14 @@ private:
     uint32_t m_encodeWidth  = 0;
     uint32_t m_encodeHeight = 0;
     bool m_needsDownscale = false;
+
+    // Benchmark CSV + encode stats accumulator
+    FILE*    m_csvFile             = nullptr;
+    int64_t  m_lastStatsDumpUs     = 0;
+    int64_t  m_totalEncodeUs       = 0;
+    uint32_t m_encodeFrameCount    = 0;
+    int64_t  m_minEncodeUs         = INT64_MAX;
+    int64_t  m_maxEncodeUs         = 0;
 
     bool InitVideoProcessor();
 

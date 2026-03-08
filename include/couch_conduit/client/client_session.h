@@ -27,6 +27,9 @@ public:
         HWND        hwnd         = nullptr;
         std::array<uint8_t, 16> sessionKey{};
         bool        encrypted    = false;
+        // Benchmark mode
+        std::string csvPath;        // If non-empty, write periodic stats CSV
+        int64_t     processStartUs = 0;  // For startup metrics
     };
 
     bool Init(const Config& config);
