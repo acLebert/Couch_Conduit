@@ -16,6 +16,7 @@ add_executable(cc_client
     decode/d3d11_decoder.cpp
     render/renderer.cpp
     render/overlay.cpp
+    ui/connection_screen.cpp
     input/input_capture.cpp
     audio/audio_player.cpp
     client_session.cpp

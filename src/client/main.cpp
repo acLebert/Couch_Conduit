@@ -10,6 +10,7 @@
 #include <couch_conduit/common/session.h>
 #include <couch_conduit/common/log.h>
 #include <couch_conduit/client/client_session.h>
+#include <couch_conduit/client/connection_screen.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -225,6 +226,8 @@ struct CliArgs {
     bool        vsync = false;
     bool        fullscreen = false;
     bool        noSession = false;
+    bool        hasHostArg = false;        // True if user specified a host on CLI
+    std::string signalingServer;           // Room code signaling server URL
 };
 
 CliArgs ParseArgs(int argc, char* argv[]) {
@@ -232,6 +235,7 @@ CliArgs ParseArgs(int argc, char* argv[]) {
 
     if (argc >= 2 && argv[1][0] != '-') {
         args.hostAddr = argv[1];
+        args.hasHostArg = true;
     }
 
     for (int i = 1; i < argc; ++i) {
@@ -243,6 +247,8 @@ CliArgs ParseArgs(int argc, char* argv[]) {
             args.fullscreen = true;
         } else if (strcmp(argv[i], "--no-session") == 0) {
             args.noSession = true;
+        } else if (strcmp(argv[i], "--signaling-server") == 0 && i + 1 < argc) {
+            args.signalingServer = argv[++i];
         } else if (strcmp(argv[i], "--resolution") == 0 && i + 1 < argc) {
             ++i;
             sscanf(argv[i], "%ux%u", &args.width, &args.height);
@@ -255,6 +261,7 @@ CliArgs ParseArgs(int argc, char* argv[]) {
             printf("  --vsync                Enable V-Sync (adds latency)\n");
             printf("  --fullscreen           Start in fullscreen mode\n");
             printf("  --no-session           Skip TCP session (direct UDP)\n");
+            printf("  --signaling-server <url> Signaling server for room codes\n");
             printf("  --resolution <WxH>     Window resolution (default: 1920x1080)\n");
             printf("  --help                 Show this help\n");
             exit(0);
@@ -267,6 +274,12 @@ CliArgs ParseArgs(int argc, char* argv[]) {
 int main(int argc, char* argv[]) {
     auto args = ParseArgs(argc, argv);
 
+    // Check environment variable for signaling server
+    if (args.signalingServer.empty()) {
+        const char* envUrl = std::getenv("CC_SIGNALING_URL");
+        if (envUrl && envUrl[0]) args.signalingServer = envUrl;
+    }
+
     printf("\n");
     printf("  ========================================\n");
     printf("  ===      COUCH CONDUIT CLIENT        ===\n");
@@ -276,13 +289,45 @@ int main(int argc, char* argv[]) {
 
     CC_INFO("Couch Conduit Client v%u.%u.%u starting...",
             cc::kVersionMajor, cc::kVersionMinor, cc::kVersionPatch);
-    CC_INFO("Connecting to host: %s", args.hostAddr.c_str());
 
     // Initialize Winsock
     if (!cc::transport::InitWinsock()) {
         CC_FATAL("Failed to initialize Winsock");
         return 1;
     }
+
+    // ===================================================================
+    // If no host specified on CLI and not in direct/no-session mode,
+    // show the connection screen so friends can just double-click & go.
+    // ===================================================================
+    bool showConnectionScreen = !args.hasHostArg && !args.noSession;
+
+    // Create window early (shared between connection screen and game)
+    g_hwnd = CreateGameWindow(args.width, args.height, args.fullscreen);
+    if (!g_hwnd) {
+        CC_FATAL("Failed to create window");
+        cc::transport::CleanupWinsock();
+        return 1;
+    }
+
+    if (showConnectionScreen) {
+        CC_INFO("No host specified — showing connection screen");
+
+        auto connResult = cc::client::ShowConnectionScreen(
+            g_hwnd, args.width, args.height, args.signalingServer);
+
+        if (!connResult.connected || connResult.cancelled) {
+            CC_INFO("Connection cancelled by user");
+            DestroyWindow(g_hwnd);
+            cc::transport::CleanupWinsock();
+            return 0;
+        }
+
+        args.hostAddr = connResult.hostAddr;
+        CC_INFO("Connecting to %s:%u", args.hostAddr.c_str(), connResult.controlPort);
+    }
+
+    CC_INFO("Connecting to host: %s", args.hostAddr.c_str());
 
     // Session negotiation variables
     std::array<uint8_t, 16> sessionKey{};
@@ -309,11 +354,14 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Create window (use negotiated or CLI resolution)
-    g_hwnd = CreateGameWindow(negotiatedWidth, negotiatedHeight, args.fullscreen);
-    if (!g_hwnd) {
-        CC_FATAL("Failed to create window");
-        return 1;
+    // Resize window if negotiated resolution differs
+    if (g_hwnd && (negotiatedWidth != args.width || negotiatedHeight != args.height)) {
+        DWORD style = static_cast<DWORD>(GetWindowLongW(g_hwnd, GWL_STYLE));
+        RECT rect = {0, 0, static_cast<LONG>(negotiatedWidth), static_cast<LONG>(negotiatedHeight)};
+        AdjustWindowRect(&rect, style, FALSE);
+        SetWindowPos(g_hwnd, nullptr, 0, 0,
+                     rect.right - rect.left, rect.bottom - rect.top,
+                     SWP_NOMOVE | SWP_NOZORDER);
     }
 
     CC_INFO("Window created: %ux%u, vsync=%s, fullscreen=%s, encrypted=%s",

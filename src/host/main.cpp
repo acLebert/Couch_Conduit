@@ -8,6 +8,8 @@
 #include <couch_conduit/common/types.h>
 #include <couch_conduit/common/transport.h>
 #include <couch_conduit/common/session.h>
+#include <couch_conduit/common/signaling.h>
+#include <couch_conduit/common/stun.h>
 #include <couch_conduit/common/log.h>
 #include <couch_conduit/host/host_session.h>
 
@@ -32,6 +34,7 @@ struct CliArgs {
     uint32_t    encodeHeight = 0;
     cc::VideoCodec codec = cc::VideoCodec::HEVC;
     bool        noSession = false;  // Skip TCP session negotiation
+    std::string signalingServer;    // Room code signaling server URL
 };
 
 CliArgs ParseArgs(int argc, char* argv[]) {
@@ -57,6 +60,8 @@ CliArgs ParseArgs(int argc, char* argv[]) {
             }
         } else if (strcmp(argv[i], "--no-session") == 0) {
             args.noSession = true;
+        } else if (strcmp(argv[i], "--signaling-server") == 0 && i + 1 < argc) {
+            args.signalingServer = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Couch Conduit Host v%u.%u.%u\n\n",
                    cc::kVersionMajor, cc::kVersionMinor, cc::kVersionPatch);
@@ -68,6 +73,7 @@ CliArgs ParseArgs(int argc, char* argv[]) {
             printf("  --codec <codec>      Video codec: h264, hevc, av1 (default: hevc)\n");
             printf("  --encode-resolution <WxH>  Encode resolution (default: capture res)\n");
             printf("  --no-session         Skip TCP session/key exchange (direct UDP)\n");
+            printf("  --signaling-server <url>  Signaling server for room codes\n");
             printf("  --help               Show this help\n");
             exit(0);
         }
@@ -76,6 +82,12 @@ CliArgs ParseArgs(int argc, char* argv[]) {
     // Legacy mode requires --client
     if (args.noSession && args.clientHost.empty()) {
         args.clientHost = "127.0.0.1";
+    }
+
+    // Check environment variable for signaling server
+    if (args.signalingServer.empty()) {
+        const char* envUrl = std::getenv("CC_SIGNALING_URL");
+        if (envUrl && envUrl[0]) args.signalingServer = envUrl;
     }
 
     return args;
@@ -111,6 +123,36 @@ int main(int argc, char* argv[]) {
     sessionConfig.video.codec       = args.codec;
     sessionConfig.encodeWidth       = args.encodeWidth;
     sessionConfig.encodeHeight      = args.encodeHeight;
+
+    // ─── Room Code Registration ────────────────────────────────────
+    std::string roomCode;
+    std::string localIp = cc::net::SignalingClient::GetLocalIp();
+
+    if (!args.noSession && !args.signalingServer.empty()) {
+        CC_INFO("Discovering public IP via STUN...");
+        auto stun = cc::net::StunClient::DiscoverAny();
+
+        if (stun.success) {
+            CC_INFO("Public endpoint: %s:%u", stun.publicIp.c_str(), stun.publicPort);
+
+            if (cc::net::SignalingClient::CreateRoom(
+                    args.signalingServer, stun.publicIp,
+                    cc::kDefaultControlPort, roomCode)) {
+                printf("\n");
+                printf("  +--------------------------------------+\n");
+                printf("  |                                      |\n");
+                printf("  |   Room Code:   %-6s               |\n", roomCode.c_str());
+                printf("  |                                      |\n");
+                printf("  +--------------------------------------+\n");
+                printf("  Share this code with friends to connect!\n\n");
+                printf("  Public IP : %s:%u\n", stun.publicIp.c_str(), cc::kDefaultControlPort);
+            }
+        } else {
+            CC_WARN("STUN discovery failed — room code unavailable");
+        }
+    }
+
+    printf("  Local IP  : %s:%u\n\n", localIp.c_str(), cc::kDefaultControlPort);
 
     // TCP session negotiation (unless --no-session)
     if (!args.noSession) {
@@ -182,6 +224,12 @@ int main(int argc, char* argv[]) {
     CC_INFO("Shutting down...");
     session->Stop();
     session.reset();
+
+    // Clean up room code from signaling server
+    if (!roomCode.empty() && !args.signalingServer.empty()) {
+        cc::net::SignalingClient::DeleteRoom(args.signalingServer, roomCode);
+    }
+
     cc::transport::CleanupWinsock();
 
     return 0;

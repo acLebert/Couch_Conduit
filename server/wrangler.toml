@@ -1,0 +1,10 @@
+name = "couch-conduit-signaling"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# KV namespace for room storage
+# Run: wrangler kv:namespace create ROOMS
+# Then paste the binding ID below
+[[kv_namespaces]]
+binding = "ROOMS"
+id = "YOUR_KV_NAMESPACE_ID"

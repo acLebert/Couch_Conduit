@@ -12,6 +12,7 @@ add_library(cc_common STATIC
     crypto/aes_gcm.cpp
     fec/reed_solomon.cpp
     net/stun.cpp
+    net/signaling.cpp
     util/system_tuning.cpp
 )
 
@@ -25,6 +26,7 @@ target_link_libraries(cc_common PUBLIC
     avrt        # MMCSS
     gdi32       # D3DKMT
     bcrypt      # AES-GCM (CNG)
+    winhttp     # Signaling server HTTP
 )
 
 target_compile_definitions(cc_common PUBLIC
